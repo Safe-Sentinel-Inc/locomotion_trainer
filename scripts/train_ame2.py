@@ -304,6 +304,21 @@ def run_student_training(teacher_ckpt: str):
         device=args.device,
     )
 
+    # ── Student Domain Randomization (Appendix B — all values [stated]) ──────
+    # Depth scan degradation: 15 % missing points, 2 % artifacts
+    env.set_student_scan_degradation(
+        dropout_rate=0.15,    # [stated] 15 % of depth points missing
+        artifact_rate=0.02,   # [stated] 2 % artifact points
+        artifact_std=0.5,     # [inferred] spike magnitude
+    )
+    # Map randomization: 90 % local-only, 1 % corruption, ±3 cm drift
+    env.set_map_randomization(
+        partial_fraction=0.90,   # [stated] 90 % local-only (10 % complete)
+        drop_fraction=0.01,      # [stated] 1 % cells corrupted
+        drift_max_m=0.03,        # [stated] ±3 cm (Appendix B)
+        corrupt_var_min=1.0,     # [stated] variance > 1 m²
+    )
+
     runner_cfg = AME2StudentDistillationRunnerCfg()
     runner_cfg.device = args.device
     if args.max_iterations:

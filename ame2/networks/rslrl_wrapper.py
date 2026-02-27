@@ -829,14 +829,16 @@ class AME2MapEnvWrapper:
         # 0 = robot always faces goal at reset; 1 = full random heading.
         self._heading_curriculum_frac: float = 1.0  # start unconstrained; set via set_heading_curriculum()
 
-        # ── Student depth scan degradation (Sec.IV-D.3) ────────────────────
-        self._scan_dropout_rate: float = 0.0   # per-pixel drop probability
-        self._artifact_std: float = 0.0         # std of additive spike artifacts
+        # ── Student depth scan degradation (Sec.IV-D.3, Appendix B) ────────
+        self._scan_dropout_rate: float = 0.0   # fraction of depth pixels zeroed (missing)
+        self._artifact_rate: float = 0.0        # fraction of depth pixels with spike artifacts
+        self._artifact_std: float = 0.0         # spike artifact magnitude (std of Gaussian)
 
-        # ── Map domain randomization (Sec.IV-D.3, Student Phase 2) ─────────
+        # ── Map domain randomization (Sec.IV-D.3, Appendix B) ───────────────
         self._partial_map_fraction: float = 0.0  # fraction of envs with local-only access
         self._map_drop_fraction: float = 0.0     # per-cell corruption probability
-        self._drift_max_cells: int = 0            # max drift offset in policy-res cells (8cm)
+        self._drift_max_m: float = 0.0            # max map drift in metres (Appendix B: 0.03 m)
+        self._corrupt_var_min: float = 1.0        # min variance for corrupted cells (m²)
 
         # Per-env mask: True = full global WTA map, False = local-only.
         # Re-sampled at episode reset.  Starts with full map access for all envs.
@@ -852,10 +854,10 @@ class AME2MapEnvWrapper:
     # Perception noise curriculum (Sec. IV-D3)
     # ------------------------------------------------------------------
 
-    #: Maximum additive Gaussian noise std applied to raw depth scans [inferred].
-    #: Corresponds to the "maximum" in "linearly from zero to maximum in first
-    #: 20 % of teacher training iterations" (Sec. IV-D3).
-    SCAN_NOISE_STD_MAX: float = 0.05   # [inferred] ~2.5× MappingNet training noise
+    #: Maximum additive Gaussian noise std applied to raw depth scans.
+    #: Appendix B: "0.05 m for map observations" (uniform noise max magnitude).
+    #: Applied as Gaussian during Phase 1 scan noise curriculum (Sec. IV-D.3).
+    SCAN_NOISE_STD_MAX: float = 0.05   # [stated] Appendix B
 
     def set_scan_noise_scale(self, scale: float) -> None:
         """Set perception noise curriculum scale for the raw depth scan.
@@ -897,59 +899,71 @@ class AME2MapEnvWrapper:
 
     def set_student_scan_degradation(
         self,
-        dropout_rate: float = 0.1,
+        dropout_rate: float = 0.15,
+        artifact_rate: float = 0.02,
         artifact_std: float = 0.5,
     ) -> None:
-        """Configure student depth scan degradation (Sec.IV-D.3).
+        """Configure student depth scan degradation (Appendix B, Sec.IV-D.3).
 
         Applies two types of sensor degradation to the raw depth scan
         BEFORE it enters MappingNet, so the student learns to build reliable
         neural maps despite realistic sensor failures.
 
         Args:
-            dropout_rate: Probability that each depth pixel is zeroed out
-                          (simulates missing/no-return measurements).  [stated]
-            artifact_std: Std of additive Gaussian spikes applied to a small
-                          random fraction (~5 %) of scan pixels (simulates
-                          multi-path reflections / erroneous returns).  [stated]
+            dropout_rate: Fraction of depth pixels zeroed out (missing returns).
+                          [stated] Appendix B: 15 %.
+            artifact_rate: Fraction of depth pixels replaced by spike artifacts
+                           (multi-path / erroneous returns).
+                           [stated] Appendix B: 2 %.
+            artifact_std:  Gaussian std of spike artifacts.  [inferred] 0.5 m.
         """
         self._scan_dropout_rate = float(dropout_rate)
+        self._artifact_rate = float(artifact_rate)
         self._artifact_std = float(artifact_std)
 
     def set_map_randomization(
         self,
-        partial_fraction: float = 0.5,
-        drop_fraction: float = 0.2,
-        drift_max_cells: int = 3,
+        partial_fraction: float = 0.90,
+        drop_fraction: float = 0.01,
+        drift_max_m: float = 0.03,
+        corrupt_var_min: float = 1.0,
     ) -> None:
         """Configure map domain randomization for student Phase 2 training.
 
-        Three independent randomization mechanisms (all stated Sec.IV-D.3):
+        Three independent randomization mechanisms (Appendix B, Sec.IV-D.3):
 
         1. **Partial map access**: ``partial_fraction`` of envs can only access
            the current local MappingNet scan (no global WTA accumulation).
            Simulates robots that have not yet built a full map of the terrain.
-           The rest of the envs use the accumulated WTA global map as normal.
+           [stated] Appendix B: 90 % local-only (10 % get complete maps).
 
         2. **Map corruption**: In every step, ``drop_fraction`` of map cells are
-           replaced with random elevation + high uncertainty (var = 1e4 sentinel),
-           forcing the policy to be robust to locally corrupted map data.
+           replaced with random elevation + random high variance (> corrupt_var_min).
+           [stated] Appendix B: 1 % of cells corrupted, variance > 1 m².
 
-        3. **Map drift**: The student and teacher policy-map crop centres are
-           perturbed by up to ±``drift_max_cells`` policy-resolution cells
-           (8 cm/cell) independently each step, simulating localization error.
+        3. **Map drift**: The student crop centre is shifted by a continuous
+           random offset uniform in [−drift_max_m, +drift_max_m] metres each
+           step.  Teacher GT crop is shifted by the same range (rounded to
+           integer cells at policy-map resolution).
+           [stated] Appendix B: ±0.03 m (= ±3 cm).
 
         Call this once before Phase 2 student training begins.  Call again with
         all zeros to disable.
 
         Args:
             partial_fraction: Fraction of envs in local-only map mode ∈ [0, 1].
+                              Default 0.90 (Appendix B: 10 % get complete maps).
             drop_fraction:    Per-cell corruption probability ∈ [0, 1].
-            drift_max_cells:  Max integer drift in policy map cells (≥ 0).
+                              Default 0.01 (Appendix B: 1 %).
+            drift_max_m:      Max crop-centre drift in metres ≥ 0.
+                              Default 0.03 (Appendix B: ±3 cm).
+            corrupt_var_min:  Minimum variance for corrupted cells (m²).
+                              Default 1.0 (Appendix B: "larger than 1 m²").
         """
         self._partial_map_fraction = float(partial_fraction)
         self._map_drop_fraction = float(drop_fraction)
-        self._drift_max_cells = int(drift_max_cells)
+        self._drift_max_m = float(drift_max_m)
+        self._corrupt_var_min = float(corrupt_var_min)
         # Immediately re-sample the partial-map mask for all envs
         self._resample_partial_mask(
             torch.arange(self.num_envs, device=self._device)
@@ -1147,12 +1161,12 @@ class AME2MapEnvWrapper:
         # Applied BEFORE MappingNet so the network learns to handle sensor failures.
         if self.is_student:
             if self._scan_dropout_rate > 0.0:
-                # Randomly zero out scan pixels (missing depth returns)  [stated]
+                # [stated] Appendix B: 15 % of depth pixels missing
                 drop_mask = torch.rand_like(raw_scan) < self._scan_dropout_rate
                 raw_scan = raw_scan.masked_fill(drop_mask, 0.0)
-            if self._artifact_std > 0.0:
-                # Sparse spike artifacts on ~5 % of pixels (multi-path, erroneous returns)  [stated]
-                spike_mask = torch.rand_like(raw_scan) < 0.05
+            if self._artifact_rate > 0.0 and self._artifact_std > 0.0:
+                # [stated] Appendix B: 2 % artifact pixels (random returns)
+                spike_mask = torch.rand_like(raw_scan) < self._artifact_rate
                 raw_scan = raw_scan + spike_mask.float() * (
                     torch.randn_like(raw_scan) * self._artifact_std
                 )
@@ -1165,12 +1179,12 @@ class AME2MapEnvWrapper:
         poses = self._robot_pose()                                # (B, 3)
         self.wta_manager.update(elev, log_var, poses)
 
-        # Student map drift: perturb crop centre by ±drift_max_cells cells.
-        # Simulates student localization error that shifts the map window.  [stated]
+        # Student map drift: continuous ±drift_max_m metres to crop centre.
+        # [stated] Appendix B: "random drift within [−0.03, 0.03] m when querying
+        # map observations" — simulates localization error in the student.
         poses_crop = poses
-        if self._drift_max_cells > 0 and self.is_student:
-            drift_m = self._drift_max_cells * self.wta_manager.wta.global_res  # metres
-            xy_off = (torch.rand(B, 2, device=self._device) * 2.0 - 1.0) * drift_m
+        if self._drift_max_m > 0.0 and self.is_student:
+            xy_off = (torch.rand(B, 2, device=self._device) * 2.0 - 1.0) * self._drift_max_m
             poses_crop = poses.clone()
             poses_crop[:, :2] = poses_crop[:, :2] + xy_off
 
@@ -1178,14 +1192,17 @@ class AME2MapEnvWrapper:
         student_map = maps["student_map"].clone()   # (B, 4, 14, 36) — writable copy
         teacher_map = maps["teacher_map"]           # (B, 3, 14, 36)
 
-        # Teacher map drift: independently shift GT crop to simulate teacher
-        # localization error (e.g., from onboard odometry drift).  [stated]
-        if self._drift_max_cells > 0:
-            di = torch.randint(-self._drift_max_cells, self._drift_max_cells + 1,
-                               (B,), device=self._device)
-            dj = torch.randint(-self._drift_max_cells, self._drift_max_cells + 1,
-                               (B,), device=self._device)
-            teacher_map = _shift_map_batch(teacher_map.float(), di, dj)
+        # Teacher map drift: same ±drift_max_m applied to GT crop centre.
+        # [stated] Appendix B: drift applies to "both the teacher and the student".
+        # At 8 cm/cell, 3 cm = 0.375 cells → integer approximation = 0..1 cells.
+        if self._drift_max_m > 0.0:
+            _drift_cells = max(0, round(self._drift_max_m / self.wta_manager.wta.global_res))
+            if _drift_cells > 0:
+                di = torch.randint(-_drift_cells, _drift_cells + 1,
+                                   (B,), device=self._device)
+                dj = torch.randint(-_drift_cells, _drift_cells + 1,
+                                   (B,), device=self._device)
+                teacher_map = _shift_map_batch(teacher_map.float(), di, dj)
 
         # ── Student map domain randomization (Sec.IV-D.3, Phase 2 only) ──────
         if self.is_student:
@@ -1206,10 +1223,14 @@ class AME2MapEnvWrapper:
                     torch.rand(B, ph, pw, device=self._device) < self._map_drop_fraction
                 )  # (B, H, W) boolean
                 drop_4 = drop_mask.unsqueeze(1).expand_as(student_map)  # (B, 4, H, W)
-                # Replacement: random elev (±0.3m scale), zero normals, high-uncertainty var
+                # [stated] Appendix B: "random values with a random variance larger than 1 m²"
                 corrupt = torch.zeros_like(student_map)
                 corrupt[:, 0] = torch.randn(B, ph, pw, device=self._device) * 0.3
-                corrupt[:, 3] = 1e4   # var = WTAMapFusion.INF_VAR sentinel (unobserved)
+                # Variance sampled from [corrupt_var_min, corrupt_var_min + 9] m²
+                corrupt[:, 3] = (
+                    self._corrupt_var_min
+                    + torch.rand(B, ph, pw, device=self._device) * 9.0
+                )
                 student_map = torch.where(drop_4, corrupt, student_map)
 
         # ── Update LSIO history ring buffer ───────────────────────────

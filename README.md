@@ -158,23 +158,28 @@ LSIO output: 184D  →  cat(cmd 3D)  →  MLP  →  prop_emb (128D)
 Base linear velocity is excluded from history (noisy on real hardware) and
 fed only to the teacher.
 
-### Domain Randomization API (Sec.IV-D.3)
+### Domain Randomization API (Sec.IV-D.3, Appendix B)
+
+All values below are **stated** in Appendix B of the paper.
 
 Configure on `AME2MapEnvWrapper`:
 
 ```python
 # Phase 1: perception noise curriculum
 env.set_scan_noise_scale(scale)          # 0.0 → 1.0 over first 20% of iters
+                                         # max std = 0.05 m [stated, Appendix B]
 
-# Phase 2: student-specific degradation
+# Phase 2: student-specific degradation  (called automatically in train_ame2.py)
 env.set_student_scan_degradation(
-    dropout_rate=0.1,    # 10% of depth points zeroed (missing returns)
-    artifact_std=0.5,    # Gaussian noise spikes on ~5% of pixels
+    dropout_rate=0.15,   # [stated] 15% of depth points missing
+    artifact_rate=0.02,  # [stated] 2% artifact (random) points
+    artifact_std=0.5,    # [inferred] spike magnitude
 )
 env.set_map_randomization(
-    partial_fraction=0.5,   # 50% of envs get local-only map (no global WTA)
-    drop_fraction=0.2,      # 20% of map cells randomly corrupted each step
-    drift_max_cells=3,      # ±3 cells (±24 cm) random pose drift
+    partial_fraction=0.90,  # [stated] 90% envs local-only (10% complete)
+    drop_fraction=0.01,     # [stated] 1% of map cells corrupted each step
+    drift_max_m=0.03,       # [stated] ±3 cm crop-centre drift
+    corrupt_var_min=1.0,    # [stated] corrupted cells: variance > 1 m²
 )
 
 # Heading curriculum (ramps alongside noise in Phase 1)
@@ -218,7 +223,7 @@ without Isaac Sim — only `ame2.ame2_env_cfg` and `ame2.__init__` require it.
 | Status | Item |
 |--------|------|
 | ⚠️ Unverified | `UniformPose2dCommandCfg(simple_heading=False)` 4D output format |
-| ⚠️ Inferred | `SCAN_NOISE_STD_MAX = 0.05` m — paper states linear increase but not the max value |
+| ✅ Confirmed | `SCAN_NOISE_STD_MAX = 0.05` m — Appendix B: "0.05 m for map observations" |
 | ⚠️ Unverified | post-hoc `runner.alg.actor_critic` replacement with current RSL-RL version |
 | ✅ Fixed | Terrain curriculum: EMA success rate (α=0.1) with promote>0.5 / demote≤0.5&d>4m (matches paper Sec. IV-D.3) |
 | ✅ Confirmed | WTA Eq.6–8 probabilistic (p_win ≈ 0.67, not deterministic) |
