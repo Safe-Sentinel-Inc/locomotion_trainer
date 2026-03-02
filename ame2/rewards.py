@@ -263,10 +263,12 @@ def undesired_events(
     stumbling = torch.any((horiz_force > vert_force) & in_contact, dim=1)
     penalty += stumbling.float()
 
-    # 6. Slippage: foot moving while in contact
-    foot_vel = asset.data.body_lin_vel_w[:, foot_sensor_cfg.body_ids, :]
-    foot_speed = torch.norm(foot_vel[:, :, :2], dim=-1)
-    slipping = torch.any((foot_speed > 0.1) & feet_in_contact, dim=1)
+    # 6. Slippage: any link moving while in contact  [stated Sec.IV-D.1]
+    # Paper says "any link moving while in contact", not just feet.
+    all_vel = asset.data.body_lin_vel_w                        # (N, num_bodies, 3)
+    all_speed = torch.norm(all_vel[:, :, :2], dim=-1)          # (N, num_bodies) xy speed
+    all_in_contact = torch.norm(all_forces, dim=-1) > 1.0      # reuse from stumbling check
+    slipping = torch.any((all_speed > 0.1) & all_in_contact, dim=1)
     penalty += slipping.float()
 
     # 7. Self-collision: collisions between robot links  [stated]
@@ -474,7 +476,7 @@ AME2_ANYMAL_D_REWARDS_CFG = {
         func=undesired_events,
         weight=-0.02,  # -1 × 0.02
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_ids=".*THIGH|.*SHANK"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_ids="base|.*THIGH|.*SHANK"),
             "foot_sensor_cfg": SceneEntityCfg("contact_forces", body_ids=".*FOOT"),
         },
     ),

@@ -1187,8 +1187,11 @@ class AME2MapEnvWrapper:
             raw_scan_flat = torch.zeros(B, self.SCAN_H * self.SCAN_W, device=self._device)
             contact_12    = torch.zeros(B, 12, device=self._device)
 
-        # Per-foot contact force magnitude: (B, 12) → reshape (B,4,3) → norm → (B, 4)
-        contact_4 = contact_12.reshape(B, 4, 3).norm(dim=-1)
+        # Per-foot binary contact state: (B, 12) → reshape (B,4,3) → norm → threshold → (B, 4)
+        # Paper (Sec IV-B): "contact state of each link" — binary contact indicators.
+        # FIX: was continuous force magnitude; now thresholded to binary (0/1).
+        contact_force_mag = contact_12.reshape(B, 4, 3).norm(dim=-1)  # (B, 4)
+        contact_4 = (contact_force_mag > 1.0).float()                 # (B, 4) binary
 
         # ── GT teacher map (teacher_map obs group, F15) ───────────────
         gt_map_flat = obs_buf.get("teacher_map")

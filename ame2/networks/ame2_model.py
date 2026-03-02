@@ -289,6 +289,7 @@ class WTAMapFusion(nn.Module):
     """
 
     INF_VAR: float = 1e4   # sentinel for unobserved cells
+    DEFAULT_STANDING_HEIGHT: float = -0.50  # ground relative to base (ANYmal-D ~0.5m tall)
 
     def __init__(
         self,
@@ -306,9 +307,11 @@ class WTAMapFusion(nn.Module):
         policy_w: int = 36,         # stated
         policy_cx: float = 0.6,     # stated
         policy_cy: float = 0.0,     # stated
+        standing_height: float | None = None,  # ground relative to base; None → use class default
     ):
         super().__init__()
         self.B          = B
+        self._standing_h = standing_height if standing_height is not None else self.DEFAULT_STANDING_HEIGHT
         self.global_h   = global_h
         self.global_w   = global_w
         self.global_res = global_res
@@ -330,7 +333,9 @@ class WTAMapFusion(nn.Module):
         self.register_buffer('_policy_pts', torch.stack([x.flatten(), y.flatten()], dim=1))
 
         # Global map state buffers — (B, 1, Hg, Wg); not parameters
-        self.register_buffer('global_elev', torch.zeros(B, 1, global_h, global_w))
+        # Paper (Sec V-A): "initialized as flat ground at the robot's standing
+        # height (ground height relative to the base) with large uncertainties."
+        self.register_buffer('global_elev', torch.full((B, 1, global_h, global_w), self._standing_h))
         self.register_buffer('global_var',  torch.full((B, 1, global_h, global_w), self.INF_VAR))
 
     # ------------------------------------------------------------------
@@ -338,12 +343,12 @@ class WTAMapFusion(nn.Module):
     # ------------------------------------------------------------------
 
     def reset(self, batch_idx=None):
-        """Reset global map to unobserved state.  Call at episode start."""
+        """Reset global map to flat ground at standing height with large uncertainty."""
         if batch_idx is None:
-            self.global_elev.zero_()
+            self.global_elev.fill_(self._standing_h)
             self.global_var.fill_(self.INF_VAR)
         else:
-            self.global_elev[batch_idx].zero_()
+            self.global_elev[batch_idx].fill_(self._standing_h)
             self.global_var[batch_idx].fill_(self.INF_VAR)
 
     # ------------------------------------------------------------------
@@ -871,6 +876,39 @@ class StudentLoss(nn.Module):
 # Part 6: Asymmetric MoE Critic  (Sec. IV-B — training only)
 # ---------------------------------------------------------------------------
 
+class CriticMapEncoder(nn.Module):
+    """
+    Non-attention map encoder for the critic (Sec. IV-B).
+
+    Paper (Sec. IV-B): "For the critic, we do not use the same attention-based
+    design as in the actor, because the critic does not need to generalize beyond
+    the training terrains and optimizing an MHA module with (L x W) local feature
+    inputs is costly."
+
+    Uses a CNN to extract spatial features, then global average pooling + MLP
+    to produce a fixed-size map embedding.  No attention mechanism.
+
+    Output dimension: d_map_emb (= 192) to match the actor's map embedding size
+    so the same expert MLPs and d_state dimension can be used.
+    """
+
+    def __init__(self, cfg: PolicyConfig, d_map: int):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(d_map, 32, 3, padding=1),  nn.ELU(inplace=True),
+            nn.Conv2d(32, 64, 3, padding=1),      nn.ELU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),               # (B, 64, 1, 1) global avg pool
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(64, cfg.d_map_emb), nn.ELU(inplace=True),
+        )
+
+    def forward(self, map_feat: torch.Tensor) -> torch.Tensor:
+        """map_feat: (B, d_map, H, W) → (B, d_map_emb)"""
+        x = self.cnn(map_feat).flatten(1)   # (B, 64)
+        return self.mlp(x)                   # (B, d_map_emb)
+
+
 class AsymmetricCritic(nn.Module):
     """
     Asymmetric Mixture-of-Experts critic for PPO value estimation (Sec. IV-B).
@@ -881,16 +919,16 @@ class AsymmetricCritic(nn.Module):
         • full proprioception incl. base_lin_vel (d_prop_raw=48)
         • per-foot contact states  (d_contact, stated in paper)
 
-    "MoE design" (stated in paper):
+    Paper (Sec. IV-B): "For the critic, we do not use the same attention-based
+    design as in the actor ... Instead, we use the mixture-of-experts (MoE)
+    design from [68]."
+
+    The critic's map is processed by a simple CNN+MLP (CriticMapEncoder),
+    NOT by the AME-2 attention encoder.  The MoE gating is contact-based:
+
         Gate network  :  f(contact_states) → weights (B, N_experts)
         Expert MLPs   :  each maps state embedding → scalar value
         Output        :  V = Σ_i gate_i · expert_i(state)
-
-    Rationale for contact-gated MoE:
-        Contact pattern encodes the robot's locomotion mode (all 4 feet down,
-        3-foot stance, 2-foot transition, …).  Different modes have very
-        different value landscapes, so mode-specialised experts + soft gating
-        produce a more accurate V(state) than a single monolithic MLP.
 
     Architecture details:
         N_experts = 4      [inferred — not stated]
@@ -908,10 +946,12 @@ class AsymmetricCritic(nn.Module):
         super().__init__()
         self.N = N_experts
 
-        # Encoder: same architecture as actor, separate weights (asymmetric inputs).
+        # FIX: critic does NOT use the attention-based AME2Encoder (Sec. IV-B).
+        # Uses a simple CNN+MLP instead — cheaper and sufficient since the critic
+        # only operates on training terrains and does not need to generalize.
+        self.map_encoder  = CriticMapEncoder(cfg, d_map=cfg.d_map_teacher)
         # Critic receives a WIDER prop (d_prop_critic=50D) with the full 5D command
         # instead of the actor's clipped 3D command.  [stated Sec.IV-E.3]
-        self.map_encoder  = AME2Encoder(cfg, d_map=cfg.d_map_teacher)
         self.prop_encoder = TeacherPropEncoder(cfg, d_prop_in=cfg.d_prop_critic)
 
         d_state = cfg.d_map_emb + cfg.d_prop_emb   # 192 + 128 = 320
@@ -937,14 +977,14 @@ class AsymmetricCritic(nn.Module):
     def forward(
         self,
         map_feat:       torch.Tensor,   # (B, d_map_teacher, H, W)  ground-truth
-        prop:           torch.Tensor,   # (B, d_prop_raw)  incl. base_lin_vel
+        prop:           torch.Tensor,   # (B, d_prop_critic)  incl. base_lin_vel
         contact_states: torch.Tensor,   # (B, d_contact)   per-foot contact
     ) -> torch.Tensor:
         """
         Returns value estimate: (B, 1).
         """
         prop_emb = self.prop_encoder(prop)
-        map_emb  = self.map_encoder(map_feat, prop_emb)
+        map_emb  = self.map_encoder(map_feat)
         state    = torch.cat([map_emb, prop_emb], dim=-1)   # (B, d_state)
 
         weights     = self.gate(contact_states)              # (B, N) — sums to 1

@@ -380,9 +380,10 @@ class AME2AnymalEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.scene.robot = ANYMAL_D_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
         # AME-2 height scanner: 31×51 @ 4cm resolution → feeds MappingNet  [inferred from MappingConfig.local_res=0.04]
+        # Center offset x=1.0m forward of base (stated: ANYmal-D local grid cx=1.0m)
         self.scene.height_scanner = RayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/" + self.base_link_name,
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            offset=RayCasterCfg.OffsetCfg(pos=(1.0, 0.0, 20.0)),
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(
                 resolution=0.04,
@@ -395,9 +396,10 @@ class AME2AnymalEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # GT policy map scanner: 14×36 @ 8 cm  [inferred]
         # Feeds the teacher's AME2Encoder — separate from the 31×51 MappingNet scanner.
+        # Center offset x=0.6m forward of base (stated: ANYmal-D policy grid cx=0.6m)
         self.scene.height_scanner_policy = RayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/" + self.base_link_name,
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            offset=RayCasterCfg.OffsetCfg(pos=(0.6, 0.0, 20.0)),
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(
                 resolution=0.08,
@@ -651,7 +653,7 @@ class AME2AnymalEnvCfg(LocomotionVelocityRoughEnvCfg):
             weight=-0.02,
             params={
                 "sensor_cfg": SceneEntityCfg(
-                    "contact_forces", body_names=[".*THIGH", ".*SHANK"]
+                    "contact_forces", body_names=["base", ".*THIGH", ".*SHANK"]
                 ),
                 "foot_sensor_cfg": SceneEntityCfg(
                     "contact_forces", body_names=[".*FOOT"]
