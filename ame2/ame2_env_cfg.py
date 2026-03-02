@@ -185,7 +185,8 @@ def gt_policy_map_flat(
     scanner = env.scene.sensors[scanner_cfg.name]
     asset = env.scene[asset_cfg.name]
 
-    hits_w = scanner.data.pos_w          # (B, H*W, 3)
+    # FIX: Isaac Lab RayCaster API uses `ray_hits_w`, not `pos_w`.
+    hits_w = scanner.data.ray_hits_w     # (B, H*W, 3)
     base_pos = asset.data.root_pos_w     # (B, 3)
 
     hits_rel = hits_w - base_pos.unsqueeze(1)  # (B, H*W, 3)
@@ -302,8 +303,11 @@ def ame2_stagnation(
         state["pos"][update_mask]  = current_pos[update_mask].clone()
         state["step"][update_mask] = env.episode_length_buf[update_mask].clone()
 
-    # Stagnant: insufficient displacement from last checkpoint
-    stagnant = disp < min_displacement
+    # Stagnant: insufficient displacement from last checkpoint.
+    # FIX: Only check stagnation when the full observation window has elapsed.
+    # Without this gate, the check fires on the step immediately after a
+    # checkpoint refresh (when disp ≈ 0), causing premature termination.
+    stagnant = (disp < min_displacement) & window_elapsed
 
     # Far from goal: use body-frame goal distance from goal_pos command
     cmd          = env.command_manager.get_command("goal_pos")  # (B, 4)

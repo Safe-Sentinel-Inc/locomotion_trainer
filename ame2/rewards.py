@@ -88,19 +88,13 @@ def heading_tracking(
     Goal command: [x_b, y_b, z_b, heading_b] — heading_b is scalar radians.
     """
     d_xy, _ = _goal_xy_dist(env, asset_cfg, command_name)
-    asset = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_command(command_name)
 
-    # Desired yaw: cmd[:, 3] = heading_b (scalar radians, body-frame)
-    desired_yaw = cmd[:, 3]
-    # Actual yaw from root quaternion
-    quat = asset.data.root_quat_w  # (N, 4) wxyz
-    actual_yaw = torch.atan2(
-        2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
-        1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-    )
-    # Wrap to [0, pi]
-    d_yaw = torch.abs(torch.atan2(torch.sin(desired_yaw - actual_yaw), torch.cos(desired_yaw - actual_yaw)))
+    # heading_b (cmd[:, 3]) from UniformPose2dCommandCfg is the RELATIVE heading
+    # error in the robot body frame.  When the robot faces the goal heading,
+    # heading_b == 0.  No world-frame yaw extraction is needed.
+    # FIX: previously compared body-frame heading_b with world-frame yaw — wrong.
+    d_yaw = torch.abs(cmd[:, 3])  # already the angular error, in [0, pi]
 
     return (1.0 / (1.0 + d_yaw ** 2)) * _t_mask(env, 2.0) * (d_xy < 0.5).float()
 
@@ -159,14 +153,10 @@ def standing_at_goal(
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_command(command_name)
 
-    # d_yaw: cmd[:, 3] = heading_b (scalar radians, body-frame)
-    desired_yaw = cmd[:, 3]
-    quat = asset.data.root_quat_w
-    actual_yaw = torch.atan2(
-        2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
-        1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-    )
-    d_yaw = torch.abs(torch.atan2(torch.sin(desired_yaw - actual_yaw), torch.cos(desired_yaw - actual_yaw)))
+    # heading_b (cmd[:, 3]) from UniformPose2dCommandCfg is the RELATIVE heading
+    # error in the robot body frame (0 when aligned with goal heading).
+    # FIX: previously compared body-frame heading_b with world-frame yaw — wrong.
+    d_yaw = torch.abs(cmd[:, 3])  # already the angular error, in [0, pi]
 
     # Gate: only active when close and aligned
     gate = ((d_xy < 0.5) & (d_yaw < 0.5)).float()

@@ -632,7 +632,15 @@ class WTAMapManager:
         log_var_local: torch.Tensor,
         poses: torch.Tensor,
     ):
-        """Update a single environment's global map via WTA logic."""
+        """Update a single environment's global map via probabilistic WTA (Eq. 6-8).
+
+        FIX: Previously used deterministic min-variance instead of the paper's
+        probabilistic WTA logic. Now matches WTAMapFusion.update() exactly:
+          Eq.6: sigma2_eff = max(sigma2_t, 0.5 * sigma2_prior)
+          Validity: sigma2_eff < 1.5 * sigma2_prior OR sigma2_eff < 0.04
+          Eq.7: p_win = prec_new / (prec_new + prec_prior)
+          Eq.8: stochastic overwrite where xi < p_win
+        """
         var_local = log_var_local.exp()
         elev_flat = elev_local.reshape(1, -1)
         var_flat = var_local.reshape(1, -1)
@@ -645,17 +653,43 @@ class WTAMapManager:
         gvar = self.wta.global_var[env_idx, 0].view(-1)
         gelev = self.wta.global_elev[env_idx, 0].view(-1)
 
-        cand = (var_flat[0] < gvar[lin]).nonzero(as_tuple=True)[0]
-        if cand.numel() == 0:
+        sigma2_prior = gvar[lin]                                    # (N,)
+        sigma2_t = var_flat[0]                                      # (N,)
+
+        # Eq. 6: effective measurement variance, lower-bounded by half the prior
+        sigma2_eff = torch.max(sigma2_t, 0.5 * sigma2_prior)       # (N,)
+
+        # Validity check (paper Sec. V-A)
+        valid = (sigma2_eff < 1.5 * sigma2_prior) | (sigma2_eff < 0.04)
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        if valid_idx.numel() == 0:
             return
 
-        c_lin = lin[cand]
-        c_var = var_flat[0][cand]
-        c_elev = elev_flat[0][cand]
+        v_lin = lin[valid_idx]
+        v_sigma2_eff = sigma2_eff[valid_idx]
+        v_sigma2_pr = sigma2_prior[valid_idx]
+        v_elev = elev_flat[0][valid_idx]
 
-        order = c_var.argsort(descending=True)
-        gvar.scatter_(0, c_lin[order], c_var[order])
-        gelev.scatter_(0, c_lin[order], c_elev[order])
+        # Eq. 7: p_win = precision_new / (precision_new + precision_prior)
+        prec_new = 1.0 / (v_sigma2_eff + 1e-8)
+        prec_prior = 1.0 / (v_sigma2_pr + 1e-8)
+        p_win = prec_new / (prec_new + prec_prior)
+
+        # Eq. 8: stochastic overwrite
+        xi = torch.rand_like(p_win)
+        wins = xi < p_win
+        win_idx = wins.nonzero(as_tuple=True)[0]
+        if win_idx.numel() == 0:
+            return
+
+        w_lin = v_lin[win_idx]
+        w_var = v_sigma2_eff[win_idx]
+        w_elev = v_elev[win_idx]
+
+        # Sort descending by var so minimum-var wins last when indices collide
+        order = w_var.argsort(descending=True)
+        gvar.scatter_(0, w_lin[order], w_var[order])
+        gelev.scatter_(0, w_lin[order], w_elev[order])
 
     def get_policy_maps(
         self,
