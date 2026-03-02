@@ -892,18 +892,19 @@ class CriticMapEncoder(nn.Module):
 
     def __init__(self, cfg: PolicyConfig, d_map: int):
         super().__init__()
+        d_cnn_out = 64  # CNN output channels — shared between CNN and MLP input
         self.cnn = nn.Sequential(
-            nn.Conv2d(d_map, 32, 3, padding=1),  nn.ELU(inplace=True),
-            nn.Conv2d(32, 64, 3, padding=1),      nn.ELU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),               # (B, 64, 1, 1) global avg pool
+            nn.Conv2d(d_map, 32, 3, padding=1),       nn.ELU(inplace=True),
+            nn.Conv2d(32, d_cnn_out, 3, padding=1),   nn.ELU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),                   # (B, d_cnn_out, 1, 1)
         )
         self.mlp = nn.Sequential(
-            nn.Linear(64, cfg.d_map_emb), nn.ELU(inplace=True),
+            nn.Linear(d_cnn_out, cfg.d_map_emb), nn.ELU(inplace=True),
         )
 
     def forward(self, map_feat: torch.Tensor) -> torch.Tensor:
         """map_feat: (B, d_map, H, W) → (B, d_map_emb)"""
-        x = self.cnn(map_feat).flatten(1)   # (B, 64)
+        x = self.cnn(map_feat).flatten(1)   # (B, d_cnn_out)
         return self.mlp(x)                   # (B, d_map_emb)
 
 

@@ -57,6 +57,9 @@ from .ame2_model import (
 )
 
 
+# Binary contact detection threshold (Newtons) — must match rewards.CONTACT_FORCE_THRESHOLD.
+CONTACT_FORCE_THRESHOLD: float = 1.0
+
 # ---------------------------------------------------------------------------
 # Left-Right Symmetry Augmentation (Sec. IV-B)
 # ---------------------------------------------------------------------------
@@ -1191,7 +1194,7 @@ class AME2MapEnvWrapper:
         # Paper (Sec IV-B): "contact state of each link" — binary contact indicators.
         # FIX: was continuous force magnitude; now thresholded to binary (0/1).
         contact_force_mag = contact_12.reshape(B, 4, 3).norm(dim=-1)  # (B, 4)
-        contact_4 = (contact_force_mag > 1.0).float()                 # (B, 4) binary
+        contact_4 = (contact_force_mag > CONTACT_FORCE_THRESHOLD).float()  # (B, 4) binary
 
         # ── GT teacher map (teacher_map obs group, F15) ───────────────
         gt_map_flat = obs_buf.get("teacher_map")

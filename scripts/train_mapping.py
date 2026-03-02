@@ -122,11 +122,12 @@ class DepthScanSimulator:
         scan = gt.clone()
         # FIX: Paper says "additive uniform noise" — was Gaussian, now uniform [-noise_max, +noise_max]
         scan = scan + (torch.rand_like(scan) * 2.0 - 1.0) * self.noise_max
-        scan[scan.abs() > self.range_max] = 0.0
-        scan[torch.rand_like(scan) < self.dropout_rate] = 0.0
+        # Range truncation and dropout — use torch.where to avoid boolean-index GPU sync
+        scan = torch.where(scan.abs() > self.range_max, torch.zeros_like(scan), scan)
+        scan = torch.where(torch.rand_like(scan) < self.dropout_rate, torch.zeros_like(scan), scan)
         # Random outliers: assign random elevation values (within typical range)
-        outlier_mask = torch.rand_like(scan) < self.outlier_rate
-        scan[outlier_mask] = (torch.rand_like(scan[outlier_mask]) * 2.0 - 1.0)
+        outlier_vals = torch.rand_like(scan) * 2.0 - 1.0
+        scan = torch.where(torch.rand_like(scan) < self.outlier_rate, outlier_vals, scan)
         return scan
 
 

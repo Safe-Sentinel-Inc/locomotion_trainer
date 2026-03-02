@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# Binary contact detection threshold (Newtons).
+# A link is considered "in contact" when its net force magnitude exceeds this value.
+# Used across standing_at_goal and undesired_events reward terms.
+CONTACT_FORCE_THRESHOLD: float = 1.0
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -164,7 +169,7 @@ def standing_at_goal(
     # d_foot: fraction of feet not in contact
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     foot_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # (N, num_feet, 3)
-    feet_in_contact = (torch.norm(foot_forces, dim=-1) > 1.0).float()  # (N, num_feet)
+    feet_in_contact = (torch.norm(foot_forces, dim=-1) > CONTACT_FORCE_THRESHOLD).float()  # (N, num_feet)
     num_feet = feet_in_contact.shape[1]
     d_foot = 1.0 - feet_in_contact.sum(dim=1) / num_feet
 
@@ -209,7 +214,7 @@ def undesired_events(
       3. non_foot_contact: any non-foot link has contact force > threshold
       4. non_foot_contact_switch: non-foot link transitions from no-contact to contact
       5. stumbling: any link has horizontal contact force > vertical force
-      6. slippage: any foot moving while in contact
+      6. slippage: any link moving while in contact
       7. self_collision: collisions between robot links  [stated]
     Weight (×dτ): -0.02  (= -1 × 0.02)
     """
@@ -225,7 +230,7 @@ def undesired_events(
     # 2. Leaping: all feet off ground on flat terrain (elev diff < threshold)
     #    Paper: "all feet are off the ground when the elevation difference is < 30 cm"
     foot_forces = contact_sensor.data.net_forces_w[:, foot_sensor_cfg.body_ids, :]
-    feet_in_contact = torch.norm(foot_forces, dim=-1) > 1.0  # (N, num_feet)
+    feet_in_contact = torch.norm(foot_forces, dim=-1) > CONTACT_FORCE_THRESHOLD  # (N, num_feet)
     all_feet_airborne = ~feet_in_contact.any(dim=1)  # (N,) True if NO foot is in contact
     # Estimate terrain flatness from height scanner if available, else use base height variance
     # Use a simple heuristic: check if height_scanner range is small
@@ -242,7 +247,7 @@ def undesired_events(
     # 3. Non-foot contact: any non-foot link has contact force > threshold
     non_foot_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
     non_foot_contact_mag = torch.norm(non_foot_forces, dim=-1)  # (N, num_non_foot)
-    non_foot_in_contact = non_foot_contact_mag > 1.0
+    non_foot_in_contact = non_foot_contact_mag > CONTACT_FORCE_THRESHOLD
     non_foot_contact = torch.any(non_foot_in_contact, dim=1)
     penalty += non_foot_contact.float()
 
@@ -251,7 +256,7 @@ def undesired_events(
     #    to allow stable interactions while discouraging new unnecessary contacts.
     if hasattr(contact_sensor.data, 'net_forces_w_history') and contact_sensor.data.net_forces_w_history.shape[1] > 1:
         prev_non_foot_forces = contact_sensor.data.net_forces_w_history[:, 1, sensor_cfg.body_ids, :]
-        prev_non_foot_contact = torch.norm(prev_non_foot_forces, dim=-1) > 1.0
+        prev_non_foot_contact = torch.norm(prev_non_foot_forces, dim=-1) > CONTACT_FORCE_THRESHOLD
         contact_switch = torch.any(non_foot_in_contact & ~prev_non_foot_contact, dim=1)
         penalty += contact_switch.float()
 
@@ -259,7 +264,7 @@ def undesired_events(
     all_forces = contact_sensor.data.net_forces_w  # (N, num_bodies, 3)
     horiz_force = torch.norm(all_forces[:, :, :2], dim=-1)
     vert_force = torch.abs(all_forces[:, :, 2])
-    in_contact = torch.norm(all_forces, dim=-1) > 1.0
+    in_contact = torch.norm(all_forces, dim=-1) > CONTACT_FORCE_THRESHOLD
     stumbling = torch.any((horiz_force > vert_force) & in_contact, dim=1)
     penalty += stumbling.float()
 
@@ -267,8 +272,7 @@ def undesired_events(
     # Paper says "any link moving while in contact", not just feet.
     all_vel = asset.data.body_lin_vel_w                        # (N, num_bodies, 3)
     all_speed = torch.norm(all_vel[:, :, :2], dim=-1)          # (N, num_bodies) xy speed
-    all_in_contact = torch.norm(all_forces, dim=-1) > 1.0      # reuse from stumbling check
-    slipping = torch.any((all_speed > 0.1) & all_in_contact, dim=1)
+    slipping = torch.any((all_speed > 0.1) & in_contact, dim=1)
     penalty += slipping.float()
 
     # 7. Self-collision: collisions between robot links  [stated]
