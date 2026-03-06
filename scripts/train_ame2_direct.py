@@ -150,6 +150,17 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
         if it % 100 == 0:
             print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m")
 
+    # lin_vel_tracking weight decay: 1.5 → 0.3 once robot starts walking
+    # Trigger: stagnation EMA < 0.30 (robot reliably walks, not standing still)
+    # Decay rate: -0.002/iter → takes ~600 iters to fully decay
+    _W_LIN_MIN = 0.3
+    if _stag_ema[0] < 0.30 and env_direct.cfg.w_lin_vel_tracking > _W_LIN_MIN:
+        env_direct.cfg.w_lin_vel_tracking = max(
+            _W_LIN_MIN, env_direct.cfg.w_lin_vel_tracking - 0.002
+        )
+        if it % 100 == 0:
+            print(f"[LinVelDecay] it={it}: w_lin_vel_tracking→{env_direct.cfg.w_lin_vel_tracking:.3f}")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
