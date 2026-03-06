@@ -15,13 +15,13 @@ while true; do
   echo "[$(date)] Run $run started. Checkpoint: ${CKPT:-none}" >> $CRASH_LOG
 
   if [ -n "$CKPT" ]; then
-    cd $BASE && CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    cd $BASE && CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
       $PYTHON -u scripts/train_ame2_direct.py \
       --num_envs 2048 --max_iterations 80000 --seed 42 \
       --log_dir logs_direct_v4 --headless \
       --resume "$CKPT" >> $LOG 2>&1
   else
-    cd $BASE && CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    cd $BASE && CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
       $PYTHON -u scripts/train_ame2_direct.py \
       --num_envs 2048 --max_iterations 80000 --seed 42 \
       --log_dir logs_direct_v4 --headless >> $LOG 2>&1

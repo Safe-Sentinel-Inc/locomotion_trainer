@@ -916,11 +916,13 @@ class AsymmetricCritic(nn.Module):
     "Asymmetric": privileged inputs unavailable to the student policy:
         • ground-truth elevation map  (d_map_teacher=3 channels)
         • full proprioception incl. base_lin_vel (d_prop_raw=48)
-        • per-foot contact states  (d_contact, stated in paper)
+        • all-link binary contact states  (d_contact=13, stated in paper)
 
     Paper (Sec. IV-B): "For the critic, we do not use the same attention-based
     design as in the actor ... Instead, we use the mixture-of-experts (MoE)
     design from [68]."
+    Paper (Sec. IV-B): "we additionally provide the contact state of each link
+    to the critic."
 
     The critic's map is processed by a simple CNN+MLP (CriticMapEncoder),
     NOT by the AME-2 attention encoder.  The MoE gating is contact-based:
@@ -931,7 +933,7 @@ class AsymmetricCritic(nn.Module):
 
     Architecture details:
         N_experts = 4      [inferred — not stated]
-        d_contact = 4      [inferred — one binary state per foot, ANYmal-D]
+        d_contact = 13     [stated Sec.IV-B — "contact state of each link": base+4×(thigh+shank+foot)]
         d_hidden  = 256    [inferred]
     """
 
@@ -939,7 +941,7 @@ class AsymmetricCritic(nn.Module):
         self,
         cfg: PolicyConfig,
         N_experts: int = 4,    # [inferred]
-        d_contact:  int = 4,   # [inferred] per-foot contact (ANYmal-D: 4 feet)
+        d_contact:  int = 13,  # [stated Sec.IV-B] all-link binary: base(1)+thigh(4)+shank(4)+foot(4)
         d_hidden:   int = 256,  # [inferred]
     ):
         super().__init__()
@@ -1080,8 +1082,8 @@ if __name__ == "__main__":
     critic = AsymmetricCritic(cfg)
     # Critic receives 50D prop: base(45D) + critic_cmd(5D: x_rel,y_rel,sin,cos,t_remain)
     prop_critic = torch.randn(B, cfg.d_prop_critic)
-    contact = torch.zeros(B, 4)   # (B, d_contact) — 4 foot contacts
-    contact[:, :2] = 1.0          # front two feet on ground
+    contact = torch.zeros(B, 13)  # (B, d_contact) — 13 all-link binary contact states
+    contact[:, 9:11] = 1.0        # front two feet on ground (foot indices 9-10 = LF, RF)
     value = critic(map_t, prop_critic, contact)
     print(f"  map:          {map_t.shape}")
     print(f"  critic_prop:  {prop_critic.shape}  (50D = base_45 + critic_cmd_5)")

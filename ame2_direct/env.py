@@ -50,7 +50,28 @@ class AME2DirectEnv(DirectRLEnv):
         self._shank_cs_ids, _   = self._contact_sensor.find_bodies(".*SHANK")
         self._foot_cs_ids, _    = self._contact_sensor.find_bodies(".*FOOT")
         self._non_foot_cs_ids   = list(self._thigh_cs_ids) + list(self._shank_cs_ids)
+        self._all_cs_ids        = (                                                    # [stated Sec.IV-B]
+            list(self._base_cs_id) + list(self._thigh_cs_ids)
+            + list(self._shank_cs_ids) + list(self._foot_cs_ids)
+        )  # 13 links: base(1) + thigh(4) + shank(4) + foot(4)
 
+        # ── Runtime verification: log contact body ordering for L-R symmetry check ──
+        # The _LR_CONTACT_PERM in rslrl_wrapper.py assumes body order [LF, RF, LH, RH]
+        # within each group (consistent with original 4D perm [1,0,3,2]).
+        # These prints let you verify at startup; expected with ANYmal-D USD traversal:
+        #   feet:  ['LF_FOOT', 'RF_FOOT', 'LH_FOOT', 'RH_FOOT']
+        #   thighs:['LF_THIGH','RF_THIGH','LH_THIGH','RH_THIGH']
+        #   shanks:['LF_SHANK','RF_SHANK','LH_SHANK','RH_SHANK']
+        # If order is [LF, LH, RF, RH] instead, update _LR_CONTACT_PERM to
+        # [0, 3, 4, 1, 2, 7, 8, 5, 6, 11, 12, 9, 10] in rslrl_wrapper.py.
+        _body_names  = self._contact_sensor.body_names  # list[str], USD traversal order
+        _foot_names  = [_body_names[i] for i in self._foot_cs_ids]
+        _thigh_names = [_body_names[i] for i in self._thigh_cs_ids]
+        _shank_names = [_body_names[i] for i in self._shank_cs_ids]
+        print(f"[ContactOrder] feet:   {_foot_names}")
+        print(f"[ContactOrder] thighs: {_thigh_names}")
+        print(f"[ContactOrder] shanks: {_shank_names}")
+        print(f"[ContactOrder] all_cs_ids={self._all_cs_ids}  (base+thigh+shank+foot, 13 total)")
 
         # Robot body indices for kinematics (thigh acc, foot vel)
         self._thigh_rb_ids, _   = self._robot.find_bodies(".*THIGH")
@@ -75,6 +96,9 @@ class AME2DirectEnv(DirectRLEnv):
         # ── Contact history for switch detection ──
         self._prev_nf_contact = torch.zeros(n, len(self._non_foot_cs_ids), device=dev, dtype=torch.bool)
 
+        # ── Foot contact history for air-time reward (Isaac Lab anymal_c pattern) ──
+        self._prev_foot_contact = torch.zeros(n, len(self._foot_cs_ids), device=dev, dtype=torch.bool)
+
         # ── Terminated cache (set in _get_dones, used in _get_rewards) ──
         self._terminated = torch.zeros(n, device=dev, dtype=torch.bool)
 
@@ -92,7 +116,7 @@ class AME2DirectEnv(DirectRLEnv):
             "position_tracking", "position_approach", "upright_bonus",
             "heading_tracking", "moving_to_goal",
             "vel_toward_goal", "lin_vel_tracking", "standing_at_goal", "early_termination",
-            "undesired_events", "base_roll_rate", "joint_reg",
+            "undesired_events", "base_height", "feet_air_time", "base_roll_rate", "joint_reg",
             "action_smooth", "link_contact", "link_acc",
             "jpos_lim", "jvel_lim", "jtau_lim",
         ]}
@@ -169,9 +193,12 @@ class AME2DirectEnv(DirectRLEnv):
         # GT policy map: (N, 3, 14, 36) — [x_rel, y_rel, z_rel] per cell [stated]
         gt_map_4d = self._get_gt_policy_map()            # (N, 3, 14, 36)
 
-        # Per-foot contact force magnitude: (N, 4) — for AsymmetricCritic [stated]
-        foot_f    = self._contact_sensor.data.net_forces_w_history[:, 0, self._foot_cs_ids, :]
-        contact_4 = torch.norm(foot_f, dim=-1)           # (N, 4)
+        # All-link binary contact states: (N, 13) — for AsymmetricCritic [stated Sec.IV-B]
+        # Paper: "contact state of each link" — base(1)+thigh(4)+shank(4)+foot(4) = 13 links
+        all_f      = self._contact_sensor.data.net_forces_w_history[:, 0, self._all_cs_ids, :]
+        contact_13 = (torch.norm(all_f, dim=-1) > 1.0).float()   # (N, 13) binary
+        # Foot forces needed separately for privileged obs logging
+        foot_f     = self._contact_sensor.data.net_forces_w_history[:, 0, self._foot_cs_ids, :]
 
         # Critic prop: base(45D) + critic_cmd(5D) + nav_extra(5D) = 55D
         # base(45D)      = prop_flat[:, :45]  (base_vel+ang_vel+grav+q+dq+act)
@@ -241,7 +268,7 @@ class AME2DirectEnv(DirectRLEnv):
             "map":                gt_map_4d,    # (N, 3, 14, 36) — actor map input
             "map_teacher":        gt_map_4d,    # (N, 3, 14, 36) — critic map input
             "critic_prop":        critic_prop,  # (N, 55) — AsymmetricCritic input (50+5 nav)
-            "contact":            contact_4,    # (N, 4) — critic contact input
+            "contact":            contact_13,   # (N, 13) — all-link binary contact [stated Sec.IV-B]
             "teacher_privileged": obs_priv,     # (N, 1593) — logging only
         }
 
@@ -262,17 +289,44 @@ class AME2DirectEnv(DirectRLEnv):
         self._ep_sums["position_tracking"] += cfg.w_position_tracking * r_pos
 
         # 1b. position_approach — always-on dense gradient (not in paper, fills t_mask gap)
-        #     r = exp(-sigma * d_xy): d=4m→0.13, d=2m→0.37, d=0→1.0
-        r_approach = torch.exp(-0.5 * d_xy)
+        #     r = exp(-sigma * d_xy): sigma=1.5 → steeper gradient for distant goals
+        #     d=4m→0.002, d=2m→0.05, d=1m→0.22, d=0.5m→0.47, d=0→1.0
+        r_approach = torch.exp(-1.5 * d_xy)
         rew += cfg.w_position_approach * r_approach
         self._ep_sums["position_approach"] += cfg.w_position_approach * r_approach
 
         # 1c. upright_bonus — survival incentive: stay upright throughout episode
-        #     r = g_b_z^2: 1.0 when perfectly upright, 0.0 when tipped over
+        #     Upright: g_b_z ≈ -1 (gravity points down in body frame) → r = -(-1) = 1.
+        #     Inverted: g_b_z ≈ +1 → r = -(+1) clamped to 0.
+        #     Fix: g_b_z.square() was symmetric (same reward for upright AND inverted).
         g_b_z = self._robot.data.projected_gravity_b[:, 2]
-        r_upright = g_b_z.square()
+        r_upright = (-g_b_z).clamp(0.0, 1.0)
         rew += cfg.w_upright_bonus * r_upright
         self._ep_sums["upright_bonus"] += cfg.w_upright_bonus * r_upright
+
+        # 1d. base_height — prevent prone local optimum (lying still avoids -100 penalty)
+        #     r = clamp(height/0.6, 0, 1): 1.0 at nominal 0.6m, 0.0 on ground
+        base_z    = self._robot.data.root_pos_w[:, 2]
+        terrain_z = self._terrain.env_origins[:, 2]
+        r_height  = torch.clamp((base_z - terrain_z) / 0.6, 0.0, 1.0)
+        rew += cfg.w_base_height * r_height
+        self._ep_sums["base_height"] += cfg.w_base_height * r_height
+
+        # 1e. feet_air_time — Isaac Lab anymal_c pattern:
+        #     Reward foot on FIRST CONTACT after being airborne; target = 0.5s air per step.
+        #     last_air_time holds the duration of the most recent completed air phase.
+        #     (last_air - 0.5): positive if foot was in the air > 0.5s, negative if < 0.5s.
+        #     Only fires when robot is upright (g_b_z < -0.5 ≈ base faces up).
+        foot_contact = torch.norm(
+            self._contact_sensor.data.net_forces_w_history[:, 0, self._foot_cs_ids, :], dim=-1
+        ) > 1.0                                                                        # (N, 4) bool
+        first_contact = foot_contact & ~self._prev_foot_contact                        # just landed
+        last_air = self._contact_sensor.data.last_air_time[:, self._foot_cs_ids]      # (N, 4)
+        r_feet = ((last_air - 0.5) * first_contact.float()).sum(dim=1)                # (N,)
+        r_feet = r_feet * (g_b_z < -0.5).float()   # only when upright (gravity down in body frame)
+        self._prev_foot_contact = foot_contact.clone()
+        rew += cfg.w_feet_air_time * r_feet
+        self._ep_sums["feet_air_time"] += cfg.w_feet_air_time * r_feet
 
         # 2. heading_tracking Eq.(3)
         d_yaw = self._get_d_yaw()
@@ -280,12 +334,12 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_heading_tracking * r_head
         self._ep_sums["heading_tracking"] += cfg.w_heading_tracking * r_head
 
-        # 3. moving_to_goal Eq.(4)
+        # 3. moving_to_goal Eq.(4) — v_min=0.3 m/s [stated], v_max=2.0 m/s [stated]
         vel_xy  = self._robot.data.root_lin_vel_b[:, :2]
         vel_nrm = torch.norm(vel_xy, dim=1)
         to_goal = goal_xy_b / (d_xy.unsqueeze(1) + 1e-8)
         cos_t   = (vel_xy * to_goal).sum(1) / (vel_nrm + 1e-8)
-        r_move  = ((d_xy<0.5) | ((cos_t>0.5) & (vel_nrm>=0.05) & (vel_nrm<=2.0))).float()
+        r_move  = ((d_xy<0.5) | ((cos_t>0.5) & (vel_nrm>=0.3) & (vel_nrm<=2.0))).float()
         rew += cfg.w_moving_to_goal * r_move
         self._ep_sums["moving_to_goal"] += cfg.w_moving_to_goal * r_move
 
@@ -427,9 +481,14 @@ class AME2DirectEnv(DirectRLEnv):
         return torch.any(torch.norm(acc, dim=-1) > 60.0, dim=-1)
 
     def _stagnation(self) -> torch.Tensor:
-        """5s displacement < 0.5m AND goal dist > 1m [stated]."""
+        """10s displacement < 0.5m AND goal dist > 0.5m.
+
+        Paper uses 5s, but early training needs more exploration time.
+        At 5s, 86% of episodes terminate before robot can attempt locomotion.
+        10s doubles the exploration window, allowing gait learning to begin.
+        """
         curr = self._robot.data.root_pos_w[:, :2]
-        win  = max(1, int(5.0 / self.step_dt))
+        win  = max(1, int(10.0 / self.step_dt))
 
         steps_since  = self.episode_length_buf - self._stag_step
         disp         = torch.norm(curr - self._stag_pos, dim=-1)
@@ -443,7 +502,9 @@ class AME2DirectEnv(DirectRLEnv):
         d_xy = torch.norm(self._get_goal_xy_body(), dim=-1)
         # Only trigger AFTER the full 5s window has elapsed.
         # Without win_elapsed, disp≈0 at episode start → instant stagnation for any d_xy>1m.
-        return win_elapsed & ~ep_reset & (disp < 0.5) & (d_xy > 1.0)
+        # Use 0.5m threshold: matches the "at goal" condition (d_xy < 0.5m).
+        # Original paper uses 1m, but with goal_radius=0.8m all goals are <1m → never fires.
+        return win_elapsed & ~ep_reset & (disp < 0.5) & (d_xy > 0.5)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Reset
@@ -465,22 +526,41 @@ class AME2DirectEnv(DirectRLEnv):
         n   = len(env_ids)
         dev = self.device
 
+        # ── Terrain curriculum: record TERMINAL goal distance BEFORE resampling ──
+        # Must use robot.data which still holds pre-reset terminal positions.
+        terminal_d_xy = torch.norm(self._get_goal_xy_body()[env_ids], dim=-1)
+
         # ── Robot state reset ──
         default_root = self._robot.data.default_root_state[env_ids].clone()
         default_root[:, :3] += self._terrain.env_origins[env_ids]
 
-        # Random init pose (full random yaw, ±0.5 m/s velocities, Appendix B [stated])
-        # Use small random perturbation; full random orientation handled by curriculum
-        yaw_rand = torch.rand(n, device=dev) * 2 * math.pi - math.pi
-        cy, sy = torch.cos(yaw_rand/2), torch.sin(yaw_rand/2)
-        # Quaternion wxyz from pure yaw rotation
+        # ── Write XYZ position first so _resample_goals has correct robot XY ──
+        # Pass base_xy directly from default_root[:, :2] to avoid robot.data cache lag
+        # (write_root_pose_to_sim writes to PhysX but robot.data may not update until sim step)
+        self._robot.write_root_pose_to_sim(default_root[:, :7], env_ids)
+        base_xy_init = default_root[:, :2].clone()
+
+        # ── Resample goals (uses base_xy_init; must precede yaw computation) ──
+        self._resample_goals(env_ids, base_xy=base_xy_init)
+
+        # ── Initial yaw: heading curriculum [stated Sec.IV-D.3] ──
+        # frac=0: robot faces goal direction (easiest for early learning).
+        # frac=1: full random yaw. Interpolated probability in between.
+        goal_heading_w = self._goal_heading[env_ids]           # world-frame direction to goal
+        rand_yaw       = torch.rand(n, device=dev) * 2 * math.pi - math.pi
+        use_rand       = torch.rand(n, device=dev) < self.heading_curriculum_frac
+        yaw_init       = torch.where(use_rand, rand_yaw, goal_heading_w)
+
+        cy, sy = torch.cos(yaw_init / 2), torch.sin(yaw_init / 2)
         default_root[:, 3] = cy        # w
         default_root[:, 4] = 0.0       # x
         default_root[:, 5] = 0.0       # y
         default_root[:, 6] = sy        # z
-        default_root[:, 7:10] = (torch.rand(n, 3, device=dev) - 0.5) * 1.0
-        default_root[:, 10:13] = (torch.rand(n, 3, device=dev) - 0.5) * 1.0
+        # Small velocity perturbation — ±0.1 m/s: large perturbation causes instant falls
+        default_root[:, 7:10]  = (torch.rand(n, 3, device=dev) - 0.5) * 0.2
+        default_root[:, 10:13] = (torch.rand(n, 3, device=dev) - 0.5) * 0.2
 
+        # Re-write with correct quaternion (overrides the temporary pose above)
         self._robot.write_root_pose_to_sim(default_root[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root[:, 7:], env_ids)
 
@@ -496,34 +576,38 @@ class AME2DirectEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._stag_pos[env_ids]     = self._robot.data.root_pos_w[env_ids, :2].clone()
         self._stag_step[env_ids]    = self.episode_length_buf[env_ids].clone()
-        self._prev_nf_contact[env_ids] = False
-
-        # ── Resample goals ──
-        self._resample_goals(env_ids)
+        self._prev_nf_contact[env_ids]   = False
+        self._prev_foot_contact[env_ids] = False
 
         # ── Reset navigation progress buffers ──
-        # Must be after _resample_goals so goal positions are valid.
         d_xy_all = torch.norm(self._get_goal_xy_body(), dim=-1)
         self._prev_d_xy[env_ids]    = d_xy_all[env_ids]
         self._prev_yaw_err[env_ids] = self._get_d_yaw()[env_ids]
 
-        # ── Terrain curriculum ──
-        self._update_terrain_curriculum(env_ids)
+        # ── Terrain curriculum (using pre-resample terminal distance) ──
+        self._update_terrain_curriculum(env_ids, terminal_d_xy)
 
         # ── Episode logging ──
         self._log_episode_stats(env_ids)
 
-    def _resample_goals(self, env_ids: torch.Tensor) -> None:
+    def _resample_goals(self, env_ids: torch.Tensor,
+                        base_xy: torch.Tensor | None = None) -> None:
         n   = len(env_ids)
         dev = self.device
         r   = self._goal_radius
 
+        # Annulus sampling: [r_min, r_max] uniform area — avoids trivial at-goal rewards.
+        # With full-disk sampling (old), 39% of goals land within 0.5m (at-goal threshold).
+        r_min = min(0.5, r * 0.5)   # at least half r if goal_radius < 1m
+        r_sq  = r**2 - r_min**2
+        dist  = torch.sqrt(torch.rand(n, device=dev) * r_sq + r_min**2)
         angle = torch.rand(n, device=dev) * 2 * math.pi
-        dist  = torch.sqrt(torch.rand(n, device=dev)) * r  # uniform in disk
         dx    = dist * torch.cos(angle)
         dy    = dist * torch.sin(angle)
 
-        base_xy = self._robot.data.root_pos_w[env_ids, :2]
+        # base_xy passed explicitly avoids robot.data cache lag after write_root_pose_to_sim
+        if base_xy is None:
+            base_xy = self._robot.data.root_pos_w[env_ids, :2]
         self._goal_pos_w[env_ids, 0] = base_xy[:, 0] + dx
         self._goal_pos_w[env_ids, 1] = base_xy[:, 1] + dy
 
@@ -533,13 +617,16 @@ class AME2DirectEnv(DirectRLEnv):
         use_rand    = torch.rand(n, device=dev) < self.heading_curriculum_frac
         self._goal_heading[env_ids] = torch.where(use_rand, rand_yaw, to_goal_yaw)
 
-    def _update_terrain_curriculum(self, env_ids: torch.Tensor) -> None:
+    def _update_terrain_curriculum(self, env_ids: torch.Tensor,
+                                    terminal_d_xy: torch.Tensor | None = None) -> None:
         if not hasattr(self._terrain, "terrain_levels"):
             return
-        # Get current goal distances for finished episodes
-        d_xy      = torch.norm(self._get_goal_xy_body()[env_ids], dim=-1)
-        move_up   = d_xy < 0.5
-        move_down = (d_xy > 1.0) & ~move_up
+        # Use pre-computed terminal d_xy (distance at episode end, BEFORE goal resample).
+        # If not provided, fall back to current distance (legacy behaviour).
+        if terminal_d_xy is None:
+            terminal_d_xy = torch.norm(self._get_goal_xy_body()[env_ids], dim=-1)
+        move_up   = terminal_d_xy < 0.5
+        move_down = (terminal_d_xy > 1.0) & ~move_up
         self._terrain.update_env_origins(env_ids, move_up, move_down)
 
     def _log_episode_stats(self, env_ids: torch.Tensor) -> None:
@@ -592,17 +679,18 @@ class AME2DirectEnv(DirectRLEnv):
         )
 
     def _get_actor_cmd(self) -> torch.Tensor:
-        """[clip(d_xy,2), sin(yaw_rel), cos(yaw_rel)] [stated Sec.IV-E.3].
+        """[d_xy, sin(bearing), cos(bearing)] — bearing-to-goal in body frame.
 
-        yaw_rel = angle from current heading to goal heading.
-        In body frame: to_goal ≈ [cos(yaw_rel), sin(yaw_rel)], so [sin, cos]
-        encodes the goal direction — consistent with lin_vel_tracking reward.
+        bearing = atan2(gxy_b[1], gxy_b[0]): direction from robot forward to goal.
+        This is independent of goal_heading so it always points toward the goal
+        position regardless of heading curriculum state. The final-heading signal
+        reaches the actor only through the value function (critic sees goal_heading
+        explicitly via critic_cmd).
         """
-        gxy   = self._get_goal_xy_body()
-        d_xy  = torch.norm(gxy, dim=1)
-        yaw_r = self._goal_heading - self._get_yaw()
-        yaw_r = torch.atan2(torch.sin(yaw_r), torch.cos(yaw_r))
-        return torch.stack([d_xy.clamp(max=2.0), yaw_r.sin(), yaw_r.cos()], dim=1)
+        gxy     = self._get_goal_xy_body()          # (N, 2) in body frame
+        d_xy    = torch.norm(gxy, dim=1)
+        bearing = torch.atan2(gxy[:, 1], gxy[:, 0]) # angle from forward to goal
+        return torch.stack([d_xy.clamp(max=2.0), bearing.sin(), bearing.cos()], dim=1)
 
     def _get_d_yaw(self) -> torch.Tensor:
         err = self._goal_heading - self._get_yaw()
@@ -702,7 +790,7 @@ class AME2DirectEnv(DirectRLEnv):
 
     def set_goal_radius(self, radius: float) -> None:
         """Expand goal sampling radius (goal distance curriculum)."""
-        self._goal_radius = float(max(1.5, min(radius, self.cfg.goal_pos_range_max)))
+        self._goal_radius = float(max(self.cfg.goal_pos_range_init, min(radius, self.cfg.goal_pos_range_max)))
 
     def get_terrain_level(self) -> float:
         if hasattr(self._terrain, "terrain_levels"):

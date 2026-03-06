@@ -120,8 +120,8 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
 # ── Curriculum state ──────────────────────────────────────────────────────────
 
 _stag_ema       = [0.5]
-_goal_radius    = [1.5]
-_GOAL_R_MIN     = 1.5
+_goal_radius    = [0.8]
+_GOAL_R_MIN     = 0.8
 _GOAL_R_MAX     = 5.0
 _GOAL_R_STEP    = 0.3
 
@@ -144,9 +144,10 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     _stag_ema[0] = 0.05 * stag + 0.95 * _stag_ema[0]
 
     # Goal distance curriculum (legged_gym style)
+    # Always enforce current goal_radius (not just when expanding)
+    env_direct.set_goal_radius(_goal_radius[0])
     if _stag_ema[0] < 0.30 and _goal_radius[0] < _GOAL_R_MAX:
         _goal_radius[0] = min(_goal_radius[0] + _GOAL_R_STEP, _GOAL_R_MAX)
-        env_direct.set_goal_radius(_goal_radius[0])
         if it % 100 == 0:
             print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m")
 

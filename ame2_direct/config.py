@@ -116,19 +116,21 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     )
 
     # ── Goal Command ─────────────────────────────────────────────────────────
-    goal_pos_range_init: float = 1.5
+    goal_pos_range_init: float = 0.8   # reduced from 1.5: easier early goal-reaching signal
     goal_pos_range_max:  float = 5.0
 
     # ── Reward Weights ──────────────────────────────────────────────────────
     w_position_tracking:    float = 2.0       # 100 * 0.02   [stated]
-    w_position_approach:    float = 0.5       # always-on exp(-0.5*d): fills t_mask gap
+    w_position_approach:    float = 1.5       # always-on exp(-1.5*d): steeper gradient
     w_upright_bonus:        float = 0.1       # survival: stay upright throughout episode
+    w_base_height:          float = 0.3       # just enough to prevent prone; was 2.0 → dominated reward (71%)
+    w_feet_air_time:        float = 1.0       # key gait signal: reward each foot lifted (Isaac Lab anymal_c pattern)
     w_heading_tracking:     float = 1.0       # 50 * 0.02    [stated]
     w_moving_to_goal:       float = 0.4       # boosted 0.1→0.4
     w_vel_toward_goal:      float = 0.0       # disabled: subsumed by lin_vel_tracking
     w_lin_vel_tracking:     float = 1.5       # Isaac Lab standard: exp(-||cmd_vel-vel||^2/0.25)
     w_standing_at_goal:     float = 0.1       # 5 * 0.02     [stated]
-    w_early_termination:    float = -100.0    # reduced from -500: avoids value fn collapse in early training
+    w_early_termination:    float = -10.0     # reduced from -100: policy was too afraid to try walking
     w_undesired_events:     float = -0.05    # reduced from -0.2: DCMotor soft actuator → frequent body contacts
     w_base_roll_rate:       float = -0.1      # [stated]
     w_joint_regularization: float = -0.001    # [stated]

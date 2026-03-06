@@ -63,18 +63,36 @@ CONTACT_FORCE_THRESHOLD: float = 1.0
 # ---------------------------------------------------------------------------
 # Left-Right Symmetry Augmentation (Sec. IV-B)
 # ---------------------------------------------------------------------------
-# ANYmal-D joint ordering (Isaac Lab standard):
-#   idx:  0          1          2          3          4          5
-#         LF_HAA     LF_HFE     LF_KFE     RF_HAA     RF_HFE     RF_KFE
-#   idx:  6          7          8          9          10         11
-#         LH_HAA     LH_HFE     LH_KFE     RH_HAA     RH_HFE     RH_KFE
+# ANYmal-D joint ordering (Isaac Lab / Isaac Sim USD traversal — confirmed from
+# isaaclab_tasks/manager_based/locomotion/velocity/mdp/symmetry/anymal.py):
 #
-# L-R flip: swap LF↔RF (0-2 ↔ 3-5) and LH↔RH (6-8 ↔ 9-11)
-_LR_JOINT_PERM   = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
-# HAA (hip abduction) joints negate under L-R mirror; HFE/KFE stay positive
-_LR_JOINT_SIGN   = [-1., 1., 1., -1., 1., 1., -1., 1., 1., -1., 1., 1.]
-# Contact order: LF, RF, LH, RH  →  swap L↔R: RF, LF, RH, LH
-_LR_CONTACT_PERM = [1, 0, 3, 2]
+#   ['LF_HAA', 'LH_HAA', 'RF_HAA', 'RH_HAA',   ← idx 0,1,2,3
+#    'LF_HFE', 'LH_HFE', 'RF_HFE', 'RH_HFE',   ← idx 4,5,6,7
+#    'LF_KFE', 'LH_KFE', 'RF_KFE', 'RH_KFE']   ← idx 8,9,10,11
+#
+# Leg indices: LF=(0,4,8)  LH=(1,5,9)  RF=(2,6,10)  RH=(3,7,11)
+# Ordering within each type group is [LF, LH, RF, RH] — NOT [LF, RF, LH, RH].
+#
+# L-R flip: LF↔RF  and  LH↔RH
+#   HAA(0-3): LF(0)↔RF(2), LH(1)↔RH(3)  → perm [2,3,0,1]
+#   HFE(4-7): LF(4)↔RF(6), LH(5)↔RH(7)  → perm [6,7,4,5]
+#   KFE(8-11):LF(8)↔RF(10),LH(9)↔RH(11) → perm [10,11,8,9]
+_LR_JOINT_PERM   = [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9]
+# HAA joints negate under L-R mirror (abduction axis flips sign); HFE/KFE stay positive.
+# With interleaved ordering, HAA joints occupy the first 4 indices (0-3).
+_LR_JOINT_SIGN   = [-1., -1., -1., -1., 1., 1., 1., 1., 1., 1., 1., 1.]
+# All-link contact order: base(0), thigh×4(1-4), shank×4(5-8), foot×4(9-12)
+# Within each 4-element group, find_bodies(".*THIGH" etc.) returns bodies in USD
+# traversal order, which matches the joint interleaving: [LF, LH, RF, RH].
+# L-R mirror: swap LF↔RF (pos 0↔2) and LH↔RH (pos 1↔3) in each group.
+#   base(0): unchanged
+#   thigh(1-4): [LF=1,LH=2,RF=3,RH=4] → [RF=3,RH=4,LF=1,LH=2]
+#   shank(5-8): [LF=5,LH=6,RF=7,RH=8] → [RF=7,RH=8,LF=5,LH=6]
+#   foot(9-12): [LF=9,LH=10,RF=11,RH=12]→[RF=11,RH=12,LF=9,LH=10]
+#
+# RUNTIME VERIFICATION: env.py prints [ContactOrder] lines at startup showing
+# actual body_names so this assumption can be confirmed against the live USD.
+_LR_CONTACT_PERM = [0, 3, 4, 1, 2, 7, 8, 5, 6, 11, 12, 9, 10]
 
 
 def _flip_lr(
@@ -88,7 +106,7 @@ def _flip_lr(
     Args:
         map_feat:   (B, C, H, W)  — flip the W (left-right) axis.
         prop:       (B, d_prop)   — negate lateral dims, permute joint order.
-        contact:    (B, 4)        — swap left/right foot contacts.
+        contact:    (B, 13)       — swap left/right contacts (all links).
         is_teacher: True  → teacher prop layout (48): base_vel(3)|ang_vel(3)|grav(3)|q(12)|dq(12)|act(12)|cmd(3)
                     False → student prop layout (45):             ang_vel(3)|grav(3)|q(12)|dq(12)|act(12)|cmd(3)
 
@@ -102,11 +120,14 @@ def _flip_lr(
     # L-R mirror flips y → −y = flip rows (dim -2), NOT columns (dim -1).
     # BUG FIX: was torch.flip(dims=[-1]) which flipped forward axis instead.
     map_f = torch.flip(map_feat, dims=[-2])
-    # Surface normal y-component (channel 2: ny = −∂h/∂y) negates under y → −y
-    # because ∂h/∂(−y) = −∂h/∂y, so new_ny = −old_ny.
-    if map_f.shape[1] >= 3:
+    # After row-flip, y_rel values still carry the original sign (e.g. a cell at +0.5m
+    # body-y is now placed at the -0.5m row position, but its stored y_rel is still +0.5).
+    # Negate channel 1 (y_rel / lateral) to restore physical consistency.
+    # Map channel layout: [x_rel, y_rel, z_rel] (teacher, 3ch) or [x, y, z, u] (student, 4ch).
+    # z_rel / u are NOT negated (vertical and uncertainty are even under L-R).
+    if map_f.shape[1] >= 2:
         map_f = map_f.clone()          # detach from flip's storage
-        map_f[:, 2] = -map_f[:, 2]
+        map_f[:, 1] = -map_f[:, 1]    # y_rel (lateral) — odd under L-R flip
 
     # Proprioception: negate lateral-sensitive dims, permute + sign-flip joints
     prop_f = prop.clone()
@@ -134,9 +155,17 @@ def _flip_lr(
             # [45]=x_rel: forward, symmetric, no flip
             # [48]=cos(yaw): even, no flip
             # [49]=t_remaining: scalar, no flip
+        elif d == 55:
+            # Extended critic prop: 50D above + nav_extra(5D) at [50-54]
+            # nav_extra = [v_toward_goal, d_progress_rate, heading_align_rate, vel_w_x, vel_w_y]
+            prop_f[:, 46] *= -1.0   # y_rel — lateral, odd under L-R
+            prop_f[:, 47] *= -1.0   # sin(yaw_rel) — odd
+            prop_f[:, 54] *= -1.0   # world_vel_y — lateral, odd under L-R
+            # [50]=v_toward_goal: scalar dot-product, even; [51]=d_progress: even
+            # [52]=heading_align_rate: even (abs angle magnitude); [53]=vel_w_x: even
         else:
             raise ValueError(
-                f"_flip_lr is_teacher=True: unexpected prop dim {d}, expected 48 (actor) or 50 (critic)"
+                f"_flip_lr is_teacher=True: unexpected prop dim {d}, expected 48 (actor) or 50/55 (critic)"
             )
     else:
         # Offsets: ang_vel[0:3] | grav[3:6] | q[6:18] | dq[18:30] | act[30:42] | cmd[42:45]
@@ -214,7 +243,7 @@ class AME2ActorCritic(nn.Module):
         "history"      : (B, 20, 42)        prop history without base_vel/cmd (student only)
         "commands"     : (B, 3)             actor cmd [clip(d_xy,2), sin(yaw), cos(yaw)] (student only)
         "map_teacher"  : (B, 3, 14, 36)     GT map for AsymmetricCritic
-        "contact"      : (B, 4)             per-foot contact force magnitude for critic
+        "contact"      : (B, 13)            all-link binary contact states for critic [stated Sec.IV-B]
 
     obs_groups example:
         {
@@ -821,7 +850,11 @@ class AME2MapEnvWrapper:
 
     Also maintains the per-env LSIO history buffer (B, T, d_hist).
 
-    Contact:  foot_contact_forces (B,12) → per-foot magnitude (B,4).
+    Contact (manager-based path):  foot_contact_forces (B,12) → per-foot magnitude (B,4).
+    NOTE: The manager-based path only produces 4D foot contacts, NOT the full 13D
+    all-link contact used by the direct env.  When Phase 2 manager-based training is
+    activated, this path must be updated to match the direct env's 13D contact output.
+    See TODO at the contact_4 computation below.
     History:  teacher prop layout = base_vel(3)|hist(42)|cmd(3)
               student prop layout = hist(42)|cmd(3)
     """
@@ -1193,6 +1226,16 @@ class AME2MapEnvWrapper:
         # Per-foot binary contact state: (B, 12) → reshape (B,4,3) → norm → threshold → (B, 4)
         # Paper (Sec IV-B): "contact state of each link" — binary contact indicators.
         # FIX: was continuous force magnitude; now thresholded to binary (0/1).
+        #
+        # TODO (manager-based Phase 2): The manager-based env only exposes foot contact
+        # forces (4 feet × 3D = 12 floats) in the teacher_privileged obs group.  The
+        # AsymmetricCritic in AME2ActorCritic expects a 13D all-link contact vector
+        # (base+thigh+shank+foot = 13 links, [stated Sec.IV-B]).  When Phase 2 training
+        # is activated via the manager-based env, the "contact" obs group must be extended
+        # to include base(1) + thigh(4) + shank(4) + foot(4) = 13D binary contact states,
+        # and _LR_CONTACT_PERM must be used for the full 13D vector.  Until then, the
+        # manager-based path passes a 4D foot-only contact tensor, which is incompatible
+        # with the trained direct-workflow model.
         contact_force_mag = contact_12.reshape(B, 4, 3).norm(dim=-1)  # (B, 4)
         contact_4 = (contact_force_mag > CONTACT_FORCE_THRESHOLD).float()  # (B, 4) binary
 
@@ -1351,7 +1394,7 @@ if __name__ == "__main__":
         "critic_prop":  torch.randn(B, cfg.d_prop_critic),   # 50D: base(45)+critic_cmd(5)
         "map":          torch.randn(B, cfg.d_map_teacher, cfg.map_h, cfg.map_w),
         "map_teacher":  torch.randn(B, cfg.d_map_teacher, cfg.map_h, cfg.map_w),
-        "contact":      torch.zeros(B, 4),
+        "contact":      torch.zeros(B, 13),
     }, batch_size=[B])
 
     obs_groups_teacher = {
@@ -1414,6 +1457,8 @@ if __name__ == "__main__":
         "history":     torch.randn(B, cfg.prop_history, cfg.d_hist),
         "commands":    torch.randn(B, cfg.d_commands),
         "map_teacher": torch.randn(B, cfg.d_map_teacher, cfg.map_h, cfg.map_w),
+        # NOTE: manager-based env only provides 4D foot contact; direct env provides 13D.
+        # This test uses 4D as placeholder — real Phase 2 training requires 13D.
         "contact":     torch.zeros(B, 4),
     }, batch_size=[B])
 
@@ -1479,7 +1524,7 @@ if __name__ == "__main__":
     print("\n=== L-R Symmetry Augmentation ===")
     map_t   = obs_td["map_teacher"]   # (B, 3, 14, 36)
     prop_t  = obs_td["prop"]          # (B, 48)
-    cont_t  = obs_td["contact"]       # (B, 4)
+    cont_t  = obs_td["contact"]       # (B, 13)
 
     map_f, prop_f, cont_f = _flip_lr(map_t, prop_t, cont_t, is_teacher=True)
     # Double flip must recover original
