@@ -1,13 +1,17 @@
-# AME-2: Attention-Based Neural Map Encoding for Legged Locomotion
+# AME-2: Unofficial Reimplementation
 
-Standalone implementation of **AME-2** — a three-phase teacher-student RL pipeline for agile and
-generalized legged locomotion, reproducing the paper:
+> **This is an independent reimplementation, not the official code.**
+> The original paper and official results are from ETH Zurich RSL.
+> This repo reconstructs the architecture and training pipeline from the paper description.
+
+Unofficial reimplementation of **AME-2** — a three-phase teacher-student RL pipeline for
+agile and generalized legged locomotion, based on:
 
 > Chong Zhang, Victor Klemm, Fan Yang, Marco Hutter (ETH Zurich RSL)
 > "AME-2: Agile and Generalized Legged Locomotion via Attention-Based Neural Map Encoding"
 > arXiv:2601.08485
 
-Tested on **ANYmal-D** (quadruped). TRON1 biped configs included but not validated.
+Tested on **ANYmal-D** (quadruped) with Isaac Lab Direct Workflow. TRON1 biped configs included but not validated.
 
 ---
 
@@ -234,6 +238,8 @@ without Isaac Sim — only `ame2.ame2_env_cfg` and `ame2.__init__` require it.
 
 ## Citation
 
+If you use this code, please cite the original paper:
+
 ```bibtex
 @article{zhang2025ame2,
   title   = {{AME-2}: Agile and Generalized Legged Locomotion via
@@ -243,6 +249,14 @@ without Isaac Sim — only `ame2.ame2_env_cfg` and `ame2.__init__` require it.
   url     = {https://arxiv.org/abs/2601.08485}
 }
 ```
+
+---
+
+## Disclaimer
+
+This repository is an **independent reimplementation** created for research and learning purposes.
+It is not affiliated with, endorsed by, or the official release of the ETH Zurich RSL authors.
+Results may differ from those reported in the original paper.
 
 ---
 
