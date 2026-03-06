@@ -212,7 +212,7 @@ def main():
             print(f"[Resume] Resuming from iteration {it_start}")
 
     for it in range(it_start, args_cli.max_iterations):
-        runner.learn(num_learning_iterations=1, init_at_random_ep_len=(it == 0))
+        runner.learn(num_learning_iterations=1, init_at_random_ep_len=(it == it_start))
         update_curricula(rsl_env, runner, it)
 
         # Save checkpoint every 25 iters (outer loop manages, not RSL-RL internal)
