@@ -120,21 +120,26 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     goal_pos_range_max:  float = 5.0
 
     # ── Reward Weights ──────────────────────────────────────────────────────
-    w_position_tracking:    float = 0.0       # phase 2+: only fires when at goal (d<0.5m), never active early
-    w_position_approach:    float = 1.5       # always-on exp(-0.5*d): d=4m→0.135, clear gradient everywhere
-    w_upright_bonus:        float = 0.1       # stay upright
-    w_base_height:          float = 0.3       # prevent crawling
-    w_feet_air_time:        float = 1.0       # stepping gait (without this robot shuffles or hops in place)
-    w_heading_tracking:     float = 0.0       # phase 2+: only fires d<0.5m, never active early
-    w_moving_to_goal:       float = 0.0       # removed: noisy binary, redundant with vel_toward_goal
-    w_vel_toward_goal:      float = 1.0       # direct cos-based goal direction reward
-    w_lin_vel_tracking:     float = 1.5       # exp(-||cmd_vel-vel||^2/0.25): velocity toward goal
-    w_standing_at_goal:     float = 0.0       # phase 2+: only fires d<0.5m, never active early
-    w_early_termination:    float = -3.0      # small: don't fear falling so much — explore!
+    # v14: Isaac Lab Navigation-style tanh position tracking (Hoeller et al. IROS 2022)
+    # Primary goal signal: 1-tanh(d/std) — non-zero everywhere, gradient up to 2*std
+    w_goal_coarse:          float = 1.5       # continuous distance gradient: 1-tanh(d/2.0), gradient up to d=4m
+    w_goal_fine:            float = 5.0       # 1-tanh(d/0.3): reward only when actually close (<0.5m)
+    w_position_tracking:    float = 0.0       # phase 2+: only fires when at goal (d<0.5m)
+    w_position_approach:    float = 0.0       # replaced by w_goal_coarse
+    w_upright_bonus:        float = 0.3       # stay upright
+    w_base_height:          float = 0.0       # disabled: upright_bonus already covers this
+    w_feet_air_time:        float = 1.0       # stepping gait
+    w_heading_tracking:     float = 0.0       # phase 2+: only fires d<0.5m
+    w_moving_to_goal:       float = 0.0       # disabled
+    w_vel_toward_goal:      float = 3.0       # PRIMARY signal: walk at 1m/s toward goal → +3.0/step
+    w_lin_vel_tracking:     float = 0.0       # disabled
+    w_anti_stagnation:      float = 0.5       # per-step: -1 when speed<0.2 AND d>0.5m
+    w_standing_at_goal:     float = 0.0       # phase 2+: only fires d<0.5m
+    w_early_termination:    float = -2.0      # small penalty — don't fear falling, explore!
     w_undesired_events:     float = 0.0       # disabled
     w_base_roll_rate:       float = 0.0       # disabled: natural during walking
-    w_joint_regularization: float = 0.0       # disabled
-    w_action_smoothness:    float = 0.0       # disabled: thigh_acc termination already punishes over-aggression
+    w_joint_regularization: float = -0.001     # keep joints near default; prevents chaotic flailing
+    w_action_smoothness:    float = -0.005     # smooth action changes → stable gait bootstrap [AME-2 Table I]
     w_link_contact_forces:  float = 0.0       # disabled
     w_link_acceleration:    float = 0.0       # disabled
     w_joint_pos_limits:     float = -1.0      # keep: only true hard limit (joint damage)

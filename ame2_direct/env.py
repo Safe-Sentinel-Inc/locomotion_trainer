@@ -113,6 +113,7 @@ class AME2DirectEnv(DirectRLEnv):
 
         # ── Episode sums for logging ──
         self._ep_sums = {k: torch.zeros(n, device=dev) for k in [
+            "goal_coarse", "goal_fine", "anti_stagnation",
             "position_tracking", "position_approach", "upright_bonus",
             "heading_tracking", "moving_to_goal",
             "vel_toward_goal", "lin_vel_tracking", "standing_at_goal", "early_termination",
@@ -288,9 +289,21 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_position_tracking * r_pos
         self._ep_sums["position_tracking"] += cfg.w_position_tracking * r_pos
 
-        # 1b. position_approach — always-on dense gradient (not in paper, fills t_mask gap)
-        #     r = exp(-sigma * d_xy): sigma=0.5 → gradient non-trivial at 4m (was 1.5 → ≈0)
-        #     sigma=0.5: d=4m→0.135, d=2m→0.368, d=1m→0.607, d=0.5m→0.779, d=0→1.0
+        # 1b. goal_coarse — tanh-based always-on coarse position tracking
+        #     Isaac Lab Navigation-style (Hoeller et al. IROS 2022, validated ~2000 iters).
+        #     r = 1 - tanh(d/2.0): d=0→1.0, d=2m→0.24, d=4m→0.04
+        #     Gradient: sech²(d/2)/2 significant up to d≈4m. Always >0, no dead zone.
+        r_goal_coarse = 1.0 - torch.tanh(d_xy / 2.0)
+        rew += cfg.w_goal_coarse * r_goal_coarse
+        self._ep_sums["goal_coarse"] += cfg.w_goal_coarse * r_goal_coarse
+
+        # 1c. goal_fine — tanh-based fine-grained near-goal signal
+        #     r = 1 - tanh(d/0.3): significant inside 0.6m. Incentivizes actually reaching goal.
+        r_goal_fine = 1.0 - torch.tanh(d_xy / 0.3)
+        rew += cfg.w_goal_fine * r_goal_fine
+        self._ep_sums["goal_fine"] += cfg.w_goal_fine * r_goal_fine
+
+        # 1d. position_approach — kept for backward compatibility, weight=0 in v14
         r_approach = torch.exp(-0.5 * d_xy)
         rew += cfg.w_position_approach * r_approach
         self._ep_sums["position_approach"] += cfg.w_position_approach * r_approach
@@ -343,11 +356,21 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_moving_to_goal * r_move
         self._ep_sums["moving_to_goal"] += cfg.w_moving_to_goal * r_move
 
-        # 4. vel_toward_goal (dense, kept for logging compatibility)
+        # 4. vel_toward_goal (directional movement incentive)
         v_proj = (vel_xy * to_goal).sum(1)
         r_vel  = torch.clamp(v_proj/2.0, -1.0, 1.0) * (d_xy>=0.5).float()
         rew += cfg.w_vel_toward_goal * r_vel
         self._ep_sums["vel_toward_goal"] += cfg.w_vel_toward_goal * r_vel
+
+        # 4c. anti_stagnation — per-step penalty for being slow AND far from goal.
+        #     Breaks "stand still near spawn" local optimum that goal_coarse creates.
+        #     r = -1 when speed < 0.2 m/s AND d_xy > 0.5m, else 0.
+        #     Net standing: goal_coarse(0.7m)=1.6 - 0.5=1.1/step
+        #     Net walking:  goal_coarse(avg)=2.0 + vel_toward_goal=0.075 = 2.1/step → walk wins
+        speed = torch.norm(vel_xy, dim=-1)
+        r_anti_stag = -(speed < 0.2).float() * (d_xy > 0.5).float()
+        rew += cfg.w_anti_stagnation * r_anti_stag
+        self._ep_sums["anti_stagnation"] += cfg.w_anti_stagnation * r_anti_stag
 
         # 4b. lin_vel_tracking — Isaac Lab standard formula (anymal_c_env.py)
         # cmd_vel: approach goal at min(d_xy, 0.5 m/s) in body frame
@@ -474,11 +497,13 @@ class AME2DirectEnv(DirectRLEnv):
         return (base_z - terrain_z) < -0.1
 
     def _high_thigh_acceleration(self) -> torch.Tensor:
-        """Any thigh acceleration > 60 m/s² [stated]."""
-        if not hasattr(self._robot.data, 'body_lin_acc_w'):
-            return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        acc = self._robot.data.body_lin_acc_w[:, self._thigh_rb_ids, :]
-        return torch.any(torch.norm(acc, dim=-1) > 60.0, dim=-1)
+        """Disabled during Phase 1 — robot must be free to explore aggressive movements.
+
+        Thigh_acc termination trains the robot to be overly conservative (fear-falling),
+        causing it to converge to standing-still local optimum. Re-enable in Phase 2
+        after locomotion is well-established.
+        """
+        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     def _stagnation(self) -> torch.Tensor:
         """10s displacement < 0.5m AND goal dist > 0.5m.
@@ -504,7 +529,10 @@ class AME2DirectEnv(DirectRLEnv):
         # Without win_elapsed, disp≈0 at episode start → instant stagnation for any d_xy>1m.
         # Use 0.5m threshold: matches the "at goal" condition (d_xy < 0.5m).
         # Original paper uses 1m, but with goal_radius=0.8m all goals are <1m → never fires.
-        return win_elapsed & ~ep_reset & (disp < 0.5) & (d_xy > 0.5)
+        # Disabled for Phase 1 bootstrap: stagnation termination interrupts the robot
+        # before locomotion can emerge. Anti-stagnation REWARD still fires per-step.
+        # Re-enable after robot learns to walk (~2000 iterations).
+        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Reset

@@ -32,7 +32,7 @@ parser.add_argument("--num_envs",         type=int,   default=4096,
                     help="Number of parallel environments")
 parser.add_argument("--max_iterations",   type=int,   default=80_000,
                     help="Total PPO training iterations [stated: 80k]")
-parser.add_argument("--num_mini_batches", type=int,   default=4,
+parser.add_argument("--num_mini_batches", type=int,   default=96,  # batch≈512, fits 32GB GPU
                     help="Mini-batches per PPO update [stated Table VI: 4]")
 parser.add_argument("--seed",             type=int,   default=42)
 parser.add_argument("--log_dir",          type=str,   default="logs_direct")
@@ -98,14 +98,14 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.004,
-            num_learning_epochs=4,       # stated Table VI
-            num_mini_batches=num_mini_batches,
+            entropy_coef=0.02,           # raised 0.004→0.02: prevent noise collapse at iter<500
+            num_learning_epochs=2,       # reduced: 4→2 to limit gradient steps per rollout
+            num_mini_batches=num_mini_batches,  # use 96+ to keep batch<512 → fits 32GB GPU
             learning_rate=1e-3,
             schedule="adaptive",
             gamma=0.99,                  # stated Table VI
             lam=0.95,                    # stated Table VI
-            desired_kl=0.01,             # stated Table VI
+            desired_kl=0.02,             # raised 0.01→0.02: slow LR adaptation, more exploration room
             max_grad_norm=1.0,
         ),
         # obs_groups required by rsl_rl runner; AME2ActorCritic uses full TensorDict directly
@@ -163,16 +163,7 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     entropy = 0.004 - (0.004 - 0.001) * min(1.0, it / max(1, args_cli.max_iterations))
     runner.alg.entropy_coef = entropy
 
-    # lin_vel_tracking weight decay: 1.5 → 0.3 once robot starts walking
-    # Trigger: stagnation EMA < 0.30 (robot reliably walks, not standing still)
-    # Decay rate: -0.002/iter → takes ~600 iters to fully decay
-    _W_LIN_MIN = 0.3
-    if _stag_ema[0] < 0.30 and env_direct.cfg.w_lin_vel_tracking > _W_LIN_MIN:
-        env_direct.cfg.w_lin_vel_tracking = max(
-            _W_LIN_MIN, env_direct.cfg.w_lin_vel_tracking - 0.002
-        )
-        if it % 100 == 0:
-            print(f"[LinVelDecay] it={it}: w_lin_vel_tracking→{env_direct.cfg.w_lin_vel_tracking:.3f}")
+    # (lin_vel_tracking replaced by tanh position tracking in v14 — no decay needed)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -208,7 +199,8 @@ def main():
                                  args_cli.log_dir, device)
     runner = OnPolicyRunner(rsl_env, runner_cfg, args_cli.log_dir, device=device)
     # Replace default MLP actor_critic with AME2ActorCritic (post-hoc, before any training)
-    runner.alg.actor_critic = ame2_net
+    # NOTE: RSL-RL PPO stores the policy as self.policy (NOT self.actor_critic)
+    runner.alg.policy = ame2_net
     runner.alg.optimizer = torch.optim.Adam(ame2_net.parameters(), lr=1e-3)
 
     # ── Resume ──
@@ -217,7 +209,13 @@ def main():
         ckpt = torch.load(args_cli.resume, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
         ame2_net.load_state_dict(state, strict=False)
-        print("[Resume] loaded ✓")
+        # Reset action noise std to 1.0: if std collapsed (<0.7) before walking was learned,
+        # the policy is stuck in a "stand-still" local optimum.  Restoring exploration lets
+        # the policy rediscover locomotion before entropy regularization takes over.
+        with torch.no_grad():
+            ame2_net.std.fill_(1.0)
+        print(f"[Resume] loaded ✓  (std reset to 1.0)")
+
 
     # ── Speed benchmark: print iter time before training ──
     print(f"\n[AME-2 Direct] env={args_cli.num_envs}, iters={args_cli.max_iterations}, "
@@ -248,11 +246,17 @@ def main():
             elapsed   = time.time() - t0
             it_time   = elapsed / max(it - it_start + 1, 1)
             eta_days  = it_time * (args_cli.max_iterations - it) / 86400
+            ep_log = runner.env.extras.get("log", {})
+            goal_c = float(ep_log.get("Episode_Reward/goal_coarse", 0.0))
+            goal_f = float(ep_log.get("Episode_Reward/goal_fine", 0.0))
+            stag_r = float(ep_log.get("Episode_Termination/stagnation", 1.0))
             print(
                 f"[it {it:6d}] "
-                f"terrain_lv={rsl_env.get_terrain_level():.2f}  "
+                f"terrain={rsl_env.get_terrain_level():.2f}  "
                 f"stag_ema={_stag_ema[0]:.3f}  "
                 f"goal_r={_goal_radius[0]:.1f}m  "
+                f"goal_c={goal_c:.1f}  goal_f={goal_f:.2f}  "
+                f"stag_rate={stag_r:.2f}  "
                 f"iter={it_time:.1f}s  ETA={eta_days:.1f}d"
             )
 
