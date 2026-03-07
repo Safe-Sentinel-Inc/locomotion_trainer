@@ -120,16 +120,16 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     goal_pos_range_max:  float = 5.0
 
     # ── Reward Weights ──────────────────────────────────────────────────────
-    w_position_tracking:    float = 2.0       # 100 * 0.02   [stated]
-    w_position_approach:    float = 1.5       # always-on exp(-0.5*d): sigma 1.5→0.5, d=4m→0.135 (was ≈0)
-    w_upright_bonus:        float = 0.1       # survival: stay upright throughout episode
-    w_base_height:          float = 0.3       # just enough to prevent prone; was 2.0 → dominated reward (71%)
-    w_feet_air_time:        float = 1.0       # key gait signal: reward each foot lifted (Isaac Lab anymal_c pattern)
-    w_heading_tracking:     float = 1.0       # 50 * 0.02    [stated]
-    w_moving_to_goal:       float = 0.4       # boosted 0.1→0.4
-    w_vel_toward_goal:      float = 1.0       # re-enabled: clamp(v_proj/2, -1, 1) — direct cos-based goal signal
-    w_lin_vel_tracking:     float = 1.5       # Isaac Lab standard: exp(-||cmd_vel-vel||^2/0.25)
-    w_standing_at_goal:     float = 0.1       # 5 * 0.02     [stated]
+    w_position_tracking:    float = 0.0       # phase 2+: only fires when at goal (d<0.5m), never active early
+    w_position_approach:    float = 1.5       # always-on exp(-0.5*d): d=4m→0.135, clear gradient everywhere
+    w_upright_bonus:        float = 0.1       # stay upright
+    w_base_height:          float = 0.3       # prevent crawling
+    w_feet_air_time:        float = 1.0       # stepping gait (without this robot shuffles or hops in place)
+    w_heading_tracking:     float = 0.0       # phase 2+: only fires d<0.5m, never active early
+    w_moving_to_goal:       float = 0.0       # removed: noisy binary, redundant with vel_toward_goal
+    w_vel_toward_goal:      float = 1.0       # direct cos-based goal direction reward
+    w_lin_vel_tracking:     float = 1.5       # exp(-||cmd_vel-vel||^2/0.25): velocity toward goal
+    w_standing_at_goal:     float = 0.0       # phase 2+: only fires d<0.5m, never active early
     w_early_termination:    float = -10.0     # keep: must fear falling
     w_undesired_events:     float = 0.0       # disabled early: leaping/spinning rarely occur on flat terrain
     w_base_roll_rate:       float = -0.02     # reduced 0.1→0.02: natural during walking, don't over-penalize
