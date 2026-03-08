@@ -120,12 +120,12 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
 # ── Curriculum state ──────────────────────────────────────────────────────────
 
 _stag_ema        = [0.5]
-_goal_radius     = [1.0]    # start small, grow slowly
+_goal_radius     = [1.2]    # start at 1.2m (proven working distance)
 _last_expand_it  = [-100]   # last iteration goal_r was expanded (rate limiter)
 _GOAL_R_MIN      = 0.8
 _GOAL_R_MAX      = 5.0
 _GOAL_R_STEP     = 0.2      # +0.2m per expansion event
-_GOAL_R_COOLDOWN = 200      # at most one expansion per 200 iters (prevent rapid jumps)
+_GOAL_R_COOLDOWN = 400      # cooldown 200→400: slower expansion, more time to consolidate
 
 
 def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: int) -> None:
@@ -151,17 +151,22 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     stag    = float(ep_log.get("Episode_Termination/stagnation", 0.5))
     _stag_ema[0] = 0.05 * stag + 0.95 * _stag_ema[0]
 
-    # Goal distance curriculum — rate-limited to prevent oscillation
+    # Goal distance curriculum — expand only when robot is ACTUALLY reaching goals.
+    # Bug fix: stag_ema<0.25 only means no stagnation TERMINATIONS (robot moves a tiny
+    # bit to dodge the 5s/1m threshold), NOT that it's reaching goals.  Adding
+    # goal_fine_avg>3.0 ensures the robot genuinely reaches the close zone before
+    # we make goals harder.
     env_direct.set_goal_radius(_goal_radius[0])
-    cooldown_ok = (it - _last_expand_it[0]) >= _GOAL_R_COOLDOWN
-    if _stag_ema[0] < 0.25 and _goal_radius[0] < _GOAL_R_MAX and cooldown_ok:
+    goal_fine_avg = float(ep_log.get("Episode_Reward/goal_fine", 0.0))
+    cooldown_ok   = (it - _last_expand_it[0]) >= _GOAL_R_COOLDOWN
+    if _stag_ema[0] < 0.25 and goal_fine_avg > 3.0 and _goal_radius[0] < _GOAL_R_MAX and cooldown_ok:
         _goal_radius[0] = min(_goal_radius[0] + _GOAL_R_STEP, _GOAL_R_MAX)
         _last_expand_it[0] = it
-        print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  stag_ema={_stag_ema[0]:.3f}")
+        print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  goal_fine={goal_fine_avg:.1f}")
 
-    # Entropy decay: 0.004 → 0.001 linear over full training [stated Appendix C]
-    entropy = 0.004 - (0.004 - 0.001) * min(1.0, it / max(1, args_cli.max_iterations))
-    runner.alg.entropy_coef = entropy
+    # Entropy: keep at 0.02 (fixed, no decay) — decay to 0.004 was counteracting the
+    # noise-collapse fix and being overridden every iter anyway.
+    runner.alg.entropy_coef = 0.02
 
     # (lin_vel_tracking replaced by tanh position tracking in v14 — no decay needed)
 
