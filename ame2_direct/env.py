@@ -458,19 +458,20 @@ class AME2DirectEnv(DirectRLEnv):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        bad_o  = self._bad_orientation()
-        base_c = self._base_collision()
-        thigh_a = self._high_thigh_acceleration()
-        stag   = self._stagnation()
-        terminated = bad_o | base_c | thigh_a | stag
+        # V41: simplified terminations (robot_lab style)
+        # Only time_out + terrain_out_of_bounds. All behavior shaping via rewards.
+        # Removed: bad_orientation, base_collision, thigh_acc, stagnation
+        terrain_oob = self._terrain_out_of_bounds()
+        terminated = terrain_oob
         truncated  = self.episode_length_buf >= self.max_episode_length - 1
 
         self._terminated = terminated
-        # Per-condition extras for logging
-        self._term_bad_o  = bad_o
-        self._term_base_c = base_c
-        self._term_thigh  = thigh_a
-        self._term_stag   = stag
+        # Legacy logging (all zeros for disabled conditions)
+        z = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._term_bad_o  = z
+        self._term_base_c = z
+        self._term_thigh  = z
+        self._term_stag   = z
         return terminated, truncated
 
     def _bad_orientation(self) -> torch.Tensor:
@@ -478,7 +479,7 @@ class AME2DirectEnv(DirectRLEnv):
         g = self._robot.data.projected_gravity_b
         bad = (g[:,0].abs()>0.985) | (g[:,1].abs()>0.9) | (g[:,2]>0.0)
         # V41: allow 100 steps (2s) for recovery from fallen start
-        return bad & (self.episode_length_buf > 500)
+        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)  # V41: disabled
 
     def _base_collision(self) -> torch.Tensor:
         """Base collision: base height drops below terrain origin level.
@@ -533,6 +534,15 @@ class AME2DirectEnv(DirectRLEnv):
     # ─────────────────────────────────────────────────────────────────────────
     # Reset
     # ─────────────────────────────────────────────────────────────────────────
+
+
+    def _terrain_out_of_bounds(self) -> torch.Tensor:
+        """Terminate when robot moves too far from terrain origin (robot_lab style)."""
+        pos = self._robot.data.root_pos_w[:, :2]
+        origin = self._terrain.env_origins[:, :2]
+        dist = torch.norm(pos - origin, dim=1)
+        # 8m radius -- generous for goal_pos_range_max=5.0
+        return dist > 8.0
 
     def _reset_idx(self, env_ids: torch.Tensor | None) -> None:
         if env_ids is None or len(env_ids) == self.num_envs:
