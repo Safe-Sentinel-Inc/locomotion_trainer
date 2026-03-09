@@ -98,14 +98,18 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.02,           # raised 0.004→0.02: prevent noise collapse at iter<500
+            entropy_coef=0.005,          # v32: lowered 0.02→0.005; high entropy + adaptive LR
+                                         # caused std explosion (1.0→2.05); 0.005 lets policy gradient
+                                         # dominate over entropy regularization once gait is learned
             num_learning_epochs=2,       # reduced: 4→2 to limit gradient steps per rollout
             num_mini_batches=num_mini_batches,  # use 96+ to keep batch<512 → fits 32GB GPU
             learning_rate=1e-3,
             schedule="adaptive",
             gamma=0.99,                  # stated Table VI
             lam=0.95,                    # stated Table VI
-            desired_kl=0.02,             # raised 0.01→0.02: slow LR adaptation, more exploration room
+            desired_kl=0.01,             # v32: tightened 0.02→0.01; prevents adaptive LR from
+                                         # increasing LR when KL is small (noise regime), breaks
+                                         # the positive feedback loop: high_std→low_KL→higher_LR→higher_std
             max_grad_norm=1.0,
         ),
         # obs_groups required by rsl_rl runner; AME2ActorCritic uses full TensorDict directly
@@ -120,12 +124,20 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
 # ── Curriculum state ──────────────────────────────────────────────────────────
 
 _stag_ema        = [0.5]
+_goal_fine_ema   = [0.0]    # EMA of goal_fine: require sustained high before expanding
 _goal_radius     = [1.2]    # start at 1.2m (proven working distance)
 _last_expand_it  = [-100]   # last iteration goal_r was expanded (rate limiter)
+_it_start_ref    = [0]      # set in main() before loop; used for local-iter entropy decay
 _GOAL_R_MIN      = 0.8
 _GOAL_R_MAX      = 5.0
 _GOAL_R_STEP     = 0.2      # +0.2m per expansion event
-_GOAL_R_COOLDOWN = 400      # cooldown 200→400: slower expansion, more time to consolidate
+_GOAL_R_COOLDOWN = 600      # cooldown 400→600: prevent lucky spike from triggering expansion
+# v32: entropy_coef is now fixed at 0.005 in make_runner_cfg; no decay needed.
+# Previously: decay 0.02→0.007 over 3000 iters, but adaptive LR counteracted it,
+# causing std explosion to 2.05.  Fixed low entropy lets policy gradient win.
+_ENTROPY_START   = 0.005    # unused — kept for resume compat; entropy now fixed in cfg
+_ENTROPY_END     = 0.005    # same value → no-op decay
+_ENTROPY_DECAY_ITERS = 1    # effectively instant
 
 
 def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: int) -> None:
@@ -146,27 +158,35 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     )
     env_direct.set_heading_curriculum(heading_frac)
 
-    # Update stagnation EMA
+    # Update stagnation EMA and goal_fine EMA
     ep_log  = runner.env.extras.get("log", {})
     stag    = float(ep_log.get("Episode_Termination/stagnation", 0.5))
     _stag_ema[0] = 0.05 * stag + 0.95 * _stag_ema[0]
-
-    # Goal distance curriculum — expand only when robot is ACTUALLY reaching goals.
-    # Bug fix: stag_ema<0.25 only means no stagnation TERMINATIONS (robot moves a tiny
-    # bit to dodge the 5s/1m threshold), NOT that it's reaching goals.  Adding
-    # goal_fine_avg>3.0 ensures the robot genuinely reaches the close zone before
-    # we make goals harder.
-    env_direct.set_goal_radius(_goal_radius[0])
     goal_fine_avg = float(ep_log.get("Episode_Reward/goal_fine", 0.0))
-    cooldown_ok   = (it - _last_expand_it[0]) >= _GOAL_R_COOLDOWN
-    if _stag_ema[0] < 0.25 and goal_fine_avg > 3.0 and _goal_radius[0] < _GOAL_R_MAX and cooldown_ok:
+    _goal_fine_ema[0] = 0.02 * goal_fine_avg + 0.98 * _goal_fine_ema[0]  # slow EMA: ~50-iter window
+
+    # Goal distance curriculum — expand only when SUSTAINED high goal_fine (EMA > 5.0).
+    # Previous bug: instantaneous goal_fine_avg > 3.0 was satisfied by lucky spikes from
+    # noisy policy (std=1.0), causing premature expansion and policy collapse.
+    # Fix: require goal_fine_ema > 5.0 (EMA over ~50 iters) so robot must consistently
+    # reach goals before the radius grows.  Cooldown also extended 400→600.
+    env_direct.set_goal_radius(_goal_radius[0])
+    cooldown_ok = (it - _last_expand_it[0]) >= _GOAL_R_COOLDOWN
+    if _stag_ema[0] < 0.25 and _goal_fine_ema[0] > 5.0 and _goal_radius[0] < _GOAL_R_MAX and cooldown_ok:
         _goal_radius[0] = min(_goal_radius[0] + _GOAL_R_STEP, _GOAL_R_MAX)
         _last_expand_it[0] = it
-        print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  goal_fine={goal_fine_avg:.1f}")
+        print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  goal_fine_ema={_goal_fine_ema[0]:.1f}")
 
-    # Entropy: keep at 0.02 (fixed, no decay) — decay to 0.004 was counteracting the
-    # noise-collapse fix and being overridden every iter anyway.
-    runner.alg.entropy_coef = 0.02
+    # Entropy decay: 0.02 → 0.007 over first 3000 local iters.
+    # Safe at iter 1000+: policy already walks, decay won't cause locomotion collapse.
+    # Previous fix (fixed 0.02) was correct for early training (<500 iter) but now
+    # std=1.1 is preventing precision goal-reaching — entropy must decay to allow
+    # std to converge to ~0.5-0.7 where 0.3m fine-zone navigation becomes reliable.
+    local_it = max(0, it - _it_start_ref[0])
+    entropy_target = max(_ENTROPY_END,
+                         _ENTROPY_START - (_ENTROPY_START - _ENTROPY_END)
+                         * min(1.0, local_it / _ENTROPY_DECAY_ITERS))
+    runner.alg.entropy_coef = entropy_target
 
     # (lin_vel_tracking replaced by tanh position tracking in v14 — no decay needed)
 
@@ -214,12 +234,25 @@ def main():
         ckpt = torch.load(args_cli.resume, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
         ame2_net.load_state_dict(state, strict=False)
-        # Reset action noise std to 1.0: if std collapsed (<0.7) before walking was learned,
-        # the policy is stuck in a "stand-still" local optimum.  Restoring exploration lets
-        # the policy rediscover locomotion before entropy regularization takes over.
+        # Restore curriculum state (missing in old checkpoints → keep defaults)
+        if "goal_radius" in ckpt:
+            _goal_radius[0] = float(ckpt["goal_radius"])
+            print(f"[Resume] goal_radius restored: {_goal_radius[0]:.1f}m")
+        if "stag_ema" in ckpt:
+            _stag_ema[0] = float(ckpt["stag_ema"])
+            print(f"[Resume] stag_ema restored: {_stag_ema[0]:.3f}")
+        if "goal_fine_ema" in ckpt:
+            _goal_fine_ema[0] = float(ckpt["goal_fine_ema"])
+            print(f"[Resume] goal_fine_ema restored: {_goal_fine_ema[0]:.2f}")
+        if "last_expand_it" in ckpt:
+            _last_expand_it[0] = int(ckpt["last_expand_it"])
+            print(f"[Resume] last_expand_it restored: {_last_expand_it[0]}")
+        # Reset action noise std to 0.5: v32 fix — previous std=1.0 reset caused std explosion
+        # (1.0→2.05 by iter 2700) when combined with adaptive LR and entropy_coef=0.02.
+        # std=0.5 is sufficient exploration while keeping smoothness penalty manageable.
         with torch.no_grad():
-            ame2_net.std.fill_(1.0)
-        print(f"[Resume] loaded ✓  (std reset to 1.0)")
+            ame2_net.std.fill_(0.5)
+        print(f"[Resume] loaded (std reset to 1.0)")
 
 
     # ── Speed benchmark: print iter time before training ──
@@ -238,6 +271,8 @@ def main():
             it_start = int(m.group(1)) + 1
             print(f"[Resume] Resuming from iteration {it_start}")
 
+    _it_start_ref[0] = it_start  # expose to update_curricula for local-iter entropy decay
+
     for it in range(it_start, args_cli.max_iterations):
         runner.learn(num_learning_iterations=1, init_at_random_ep_len=(it == it_start))
         update_curricula(rsl_env, runner, it)
@@ -245,7 +280,13 @@ def main():
         # Save checkpoint every 25 iters (outer loop manages, not RSL-RL internal)
         if it % 25 == 0:
             ckpt_path = os.path.join(args_cli.log_dir, f"model_{it}.pt")
-            torch.save({"model_state_dict": ame2_net.state_dict()}, ckpt_path)
+            torch.save({
+                "model_state_dict": ame2_net.state_dict(),
+                "goal_radius": _goal_radius[0],
+                "stag_ema": _stag_ema[0],
+                "goal_fine_ema": _goal_fine_ema[0],
+                "last_expand_it": _last_expand_it[0],
+            }, ckpt_path)
 
         if it % 50 == 0:
             elapsed   = time.time() - t0
@@ -260,8 +301,8 @@ def main():
                 f"terrain={rsl_env.get_terrain_level():.2f}  "
                 f"stag_ema={_stag_ema[0]:.3f}  "
                 f"goal_r={_goal_radius[0]:.1f}m  "
-                f"goal_c={goal_c:.1f}  goal_f={goal_f:.2f}  "
-                f"stag_rate={stag_r:.2f}  "
+                f"goal_c={goal_c:.1f}  goal_f={goal_f:.2f}  gf_ema={_goal_fine_ema[0]:.2f}  "
+                f"stag_rate={stag_r:.2f}  ent={runner.alg.entropy_coef:.4f}  "
                 f"iter={it_time:.1f}s  ETA={eta_days:.1f}d"
             )
 

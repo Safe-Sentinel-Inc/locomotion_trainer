@@ -114,13 +114,23 @@ class AME2DirectEnv(DirectRLEnv):
         # ── Episode sums for logging ──
         self._ep_sums = {k: torch.zeros(n, device=dev) for k in [
             "goal_coarse", "goal_fine", "anti_stagnation",
-            "position_tracking", "position_approach", "upright_bonus",
+            "position_tracking", "position_approach", "upward",
             "heading_tracking", "moving_to_goal",
-            "vel_toward_goal", "lin_vel_tracking", "standing_at_goal", "early_termination",
-            "undesired_events", "base_height", "feet_air_time", "base_roll_rate", "joint_reg",
-            "action_smooth", "link_contact", "link_acc",
+            "vel_toward_goal", "lin_vel_z_l2", "standing_at_goal", "early_termination",
+            "undesired_contacts", "base_height", "feet_air_time", "ang_vel_xy_l2", "joint_reg_l2",
+            "action_rate_l2", "link_contact", "link_acc",
             "jpos_lim", "jvel_lim", "jtau_lim",
         ]}
+
+        # -- Scale reward weights by dt (V40 fix) ---------------------
+        # HIM (legged_robot.py:730): self.reward_scales[key] *= self.dt
+        # IsaacLab (reward_manager.py:149): value = func() * weight * dt
+        # Without this, DirectRLEnv weights are 50x too large (dt=0.02).
+        _dt = self.step_dt
+        for _attr in dir(cfg):
+            if _attr.startswith('w_') and isinstance(getattr(cfg, _attr), (int, float)):
+                setattr(cfg, _attr, getattr(cfg, _attr) * _dt)
+        print(f'[V40] Reward weights scaled by dt={_dt:.4f}')
 
     # ─────────────────────────────────────────────────────────────────────────
     # Setup
@@ -303,19 +313,18 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_goal_fine * r_goal_fine
         self._ep_sums["goal_fine"] += cfg.w_goal_fine * r_goal_fine
 
-        # 1d. position_approach — kept for backward compatibility, weight=0 in v14
+        # position_approach (disabled, weight=0)
         r_approach = torch.exp(-0.5 * d_xy)
         rew += cfg.w_position_approach * r_approach
         self._ep_sums["position_approach"] += cfg.w_position_approach * r_approach
 
-        # 1c. upright_bonus — survival incentive: stay upright throughout episode
-        #     Upright: g_b_z ≈ -1 (gravity points down in body frame) → r = -(-1) = 1.
-        #     Inverted: g_b_z ≈ +1 → r = -(+1) clamped to 0.
-        #     Fix: g_b_z.square() was symmetric (same reward for upright AND inverted).
+        # 1c. upward reward (robot_lab style) — reward standing upright
+        #     (1 - g_z)^2: upright=4.0, 45deg=2.89, side=1.0, upside_down=0.0
+        #     Use with POSITIVE weight (w_upward > 0)
         g_b_z = self._robot.data.projected_gravity_b[:, 2]
-        r_upright = (-g_b_z).clamp(0.0, 1.0)
-        rew += cfg.w_upright_bonus * r_upright
-        self._ep_sums["upright_bonus"] += cfg.w_upright_bonus * r_upright
+        r_upright = torch.square(1.0 - g_b_z)
+        rew += cfg.w_upward * r_upright
+        self._ep_sums["upward"] += cfg.w_upward * r_upright
 
         # 1d. base_height — prevent prone local optimum (lying still avoids -100 penalty)
         #     r = clamp(height/0.6, 0, 1): 1.0 at nominal 0.6m, 0.0 on ground
@@ -325,17 +334,15 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_base_height * r_height
         self._ep_sums["base_height"] += cfg.w_base_height * r_height
 
-        # 1e. feet_air_time — Isaac Lab anymal_c pattern:
-        #     Reward foot on FIRST CONTACT after being airborne; target = 0.5s air per step.
-        #     last_air_time holds the duration of the most recent completed air phase.
-        #     (last_air - 0.5): positive if foot was in the air > 0.5s, negative if < 0.5s.
-        #     Only fires when robot is upright (g_b_z < -0.5 ≈ base faces up).
+        # feet_air_time (disabled, weight=0)
         foot_contact = torch.norm(
             self._contact_sensor.data.net_forces_w_history[:, 0, self._foot_cs_ids, :], dim=-1
         ) > 1.0                                                                        # (N, 4) bool
         first_contact = foot_contact & ~self._prev_foot_contact                        # just landed
         last_air = self._contact_sensor.data.last_air_time[:, self._foot_cs_ids]      # (N, 4)
-        r_feet = ((last_air - 0.5) * first_contact.float()).sum(dim=1)                # (N,)
+        r_feet = ((last_air - 0.25) * first_contact.float()).sum(dim=1)               # (N,)
+        # threshold 0.5s→0.25s: quadruped air time during normal trot ~0.3-0.4s,
+        # old 0.5s threshold was penalizing normal walking patterns
         r_feet = r_feet * (g_b_z < -0.5).float()   # only when upright (gravity down in body frame)
         self._prev_foot_contact = foot_contact.clone()
         rew += cfg.w_feet_air_time * r_feet
@@ -362,61 +369,49 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_vel_toward_goal * r_vel
         self._ep_sums["vel_toward_goal"] += cfg.w_vel_toward_goal * r_vel
 
-        # 4c. anti_stagnation — per-step penalty for being slow AND far from goal.
-        #     Breaks "stand still near spawn" local optimum that goal_coarse creates.
-        #     r = -1 when speed < 0.2 m/s AND d_xy > 0.5m, else 0.
-        #     Net standing: goal_coarse(0.7m)=1.6 - 0.5=1.1/step
-        #     Net walking:  goal_coarse(avg)=2.0 + vel_toward_goal=0.075 = 2.1/step → walk wins
+        # anti_stagnation (disabled, weight=0)
         speed = torch.norm(vel_xy, dim=-1)
         r_anti_stag = -(speed < 0.2).float() * (d_xy > 0.5).float()
         rew += cfg.w_anti_stagnation * r_anti_stag
         self._ep_sums["anti_stagnation"] += cfg.w_anti_stagnation * r_anti_stag
 
-        # 4b. lin_vel_tracking — Isaac Lab standard formula (anymal_c_env.py)
-        # cmd_vel: approach goal at min(d_xy, 0.5 m/s) in body frame
-        # exp(-||cmd - vel||^2 / 0.25): dense, smooth, gradient everywhere
-        # Only active when d_xy >= 0.5m (let standing_at_goal handle close range)
-        cmd_vel = to_goal * torch.clamp(d_xy, max=0.5).unsqueeze(1)  # (N, 2), body frame
-        lin_err = (cmd_vel - vel_xy).square().sum(1)
-        r_lin   = torch.exp(-lin_err / 0.25) * (d_xy >= 0.5).float()
-        rew += cfg.w_lin_vel_tracking * r_lin
-        self._ep_sums["lin_vel_tracking"] += cfg.w_lin_vel_tracking * r_lin
+        # lin_vel_z_l2 — penalize vertical velocity (prevents bouncing)
+        r_lin = self._robot.data.root_lin_vel_b[:, 2].square()
+        rew += cfg.w_lin_vel_z_l2 * r_lin
+        self._ep_sums["lin_vel_z_l2"] += cfg.w_lin_vel_z_l2 * r_lin
 
         # 5. standing_at_goal Eq.(5)
         r_stand = self._standing_at_goal_reward(d_xy, d_yaw)
         rew += cfg.w_standing_at_goal * r_stand
         self._ep_sums["standing_at_goal"] += cfg.w_standing_at_goal * r_stand
 
-        # 6. early_termination
+        # early_termination — penalty when episode is terminated
         r_term = self._terminated.float()
         rew += cfg.w_early_termination * r_term
         self._ep_sums["early_termination"] += cfg.w_early_termination * r_term
 
-        # 7. undesired_events
+        # undesired_contacts — penalize 7 bad behaviors
         r_undes = self._undesired_events()
-        rew += cfg.w_undesired_events * r_undes
-        self._ep_sums["undesired_events"] += cfg.w_undesired_events * r_undes
+        rew += cfg.w_undesired_contacts * r_undes
+        self._ep_sums["undesired_contacts"] += cfg.w_undesired_contacts * r_undes
 
-        # 8. base_roll_rate
-        r_roll = self._robot.data.root_ang_vel_b[:, 0].square()
-        rew += cfg.w_base_roll_rate * r_roll
-        self._ep_sums["base_roll_rate"] += cfg.w_base_roll_rate * r_roll
+        # ang_vel_xy_l2 — penalize body pitch/roll angular velocity
+        r_roll = self._robot.data.root_ang_vel_b[:, :2].square().sum(1)
+        rew += cfg.w_ang_vel_xy_l2 * r_roll
+        self._ep_sums["ang_vel_xy_l2"] += cfg.w_ang_vel_xy_l2 * r_roll
 
-        # 9. joint_regularization
+        # joint_reg_l2 — penalize joint deviation from default pose
         q_err  = (self._robot.data.joint_pos - self._robot.data.default_joint_pos).square().sum(1)
-        tau_sq = self._robot.data.applied_torque.square().sum(1)
-        vel_sq = self._robot.data.joint_vel.square().sum(1)
-        r_jreg = q_err + 0.01*tau_sq + 0.001*vel_sq
-        rew += cfg.w_joint_regularization * r_jreg
-        self._ep_sums["joint_reg"] += cfg.w_joint_regularization * r_jreg
+        r_jreg = q_err
+        rew += cfg.w_joint_reg_l2 * r_jreg
+        self._ep_sums["joint_reg_l2"] += cfg.w_joint_reg_l2 * r_jreg
 
-        # 10. action_smoothness
+        # action_rate_l2 — penalize action changes between steps
         r_smooth = (self._actions - self._prev_actions).square().sum(1)
-        rew += cfg.w_action_smoothness * r_smooth
-        self._ep_sums["action_smooth"] += cfg.w_action_smoothness * r_smooth
+        rew += cfg.w_action_rate_l2 * r_smooth
+        self._ep_sums["action_rate_l2"] += cfg.w_action_rate_l2 * r_smooth
 
-        # 11. link_contact_forces (thigh+shank only; base excluded — joint forces inflate it)
-        # Only penalize non-foot, non-base links to detect body crashes into terrain.
+        # link_contact_forces (disabled, weight=0)
         nf_forces = self._contact_sensor.data.net_forces_w_history[:, 0, self._non_foot_cs_ids, :]  # (N, nf, 3)
         fmag      = torch.norm(nf_forces, dim=-1)                          # (N, nf)
         excess    = torch.clamp(fmag - 1.0, min=0.0)                      # >1N contact = undesired
@@ -424,12 +419,12 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_link_contact_forces * r_lfc
         self._ep_sums["link_contact"] += cfg.w_link_contact_forces * r_lfc
 
-        # 12. link_acceleration (sum of body speeds as proxy for acc)
+        # link_acceleration — penalize body flailing
         bvmag = torch.norm(self._robot.data.body_lin_vel_w, dim=-1).sum(1)
         rew += cfg.w_link_acceleration * bvmag
         self._ep_sums["link_acc"] += cfg.w_link_acceleration * bvmag
 
-        # 13-15. joint limits
+        # joint limits (pos, vel, torque)
         pos    = self._robot.data.joint_pos
         lims   = self._robot.data.joint_pos_limits    # (N, J, 2) or (J, 2)
         if lims.dim() == 2:
@@ -481,8 +476,9 @@ class AME2DirectEnv(DirectRLEnv):
     def _bad_orientation(self) -> torch.Tensor:
         """[stated Sec.IV-D.2] — skip step 0 to avoid noisy physics right after reset."""
         g = self._robot.data.projected_gravity_b
-        bad = (g[:,0].abs()>0.985) | (g[:,1].abs()>0.7) | (g[:,2]>0.0)
-        return bad & (self.episode_length_buf > 1)
+        bad = (g[:,0].abs()>0.985) | (g[:,1].abs()>0.9) | (g[:,2]>0.0)
+        # V41: allow 100 steps (2s) for recovery from fallen start
+        return bad & (self.episode_length_buf > 500)
 
     def _base_collision(self) -> torch.Tensor:
         """Base collision: base height drops below terrain origin level.
@@ -571,7 +567,26 @@ class AME2DirectEnv(DirectRLEnv):
         # ── Resample goals (uses base_xy_init; must precede yaw computation) ──
         self._resample_goals(env_ids, base_xy=base_xy_init)
 
-        # ── Initial yaw: heading curriculum [stated Sec.IV-D.3] ──
+        # -- Fallen start (V41): randomize roll/pitch for fraction of envs --
+        fallen_mask = torch.rand(n, device=dev) < self.cfg.fallen_start_ratio
+        roll_rand = torch.zeros(n, device=dev)
+        pitch_rand = torch.zeros(n, device=dev)
+        n_fallen = fallen_mask.sum().item()
+        if n_fallen > 0:
+            roll_rand[fallen_mask] = (
+                torch.rand(int(n_fallen), device=dev)
+                * (self.cfg.fallen_roll_range[1] - self.cfg.fallen_roll_range[0])
+                + self.cfg.fallen_roll_range[0]
+            )
+            pitch_rand[fallen_mask] = (
+                torch.rand(int(n_fallen), device=dev)
+                * (self.cfg.fallen_pitch_range[1] - self.cfg.fallen_pitch_range[0])
+                + self.cfg.fallen_pitch_range[0]
+            )
+            # Raise spawn height for fallen robots to avoid ground clipping
+            default_root[fallen_mask, 2] += 0.3
+
+                # ── Initial yaw: heading curriculum [stated Sec.IV-D.3] ──
         # frac=0: robot faces goal direction (easiest for early learning).
         # frac=1: full random yaw. Interpolated probability in between.
         goal_heading_w = self._goal_heading[env_ids]           # world-frame direction to goal
@@ -579,11 +594,14 @@ class AME2DirectEnv(DirectRLEnv):
         use_rand       = torch.rand(n, device=dev) < self.heading_curriculum_frac
         yaw_init       = torch.where(use_rand, rand_yaw, goal_heading_w)
 
+        # Build quaternion from roll, pitch, yaw (ZYX convention)
+        cr, sr = torch.cos(roll_rand / 2), torch.sin(roll_rand / 2)
+        cp, sp = torch.cos(pitch_rand / 2), torch.sin(pitch_rand / 2)
         cy, sy = torch.cos(yaw_init / 2), torch.sin(yaw_init / 2)
-        default_root[:, 3] = cy        # w
-        default_root[:, 4] = 0.0       # x
-        default_root[:, 5] = 0.0       # y
-        default_root[:, 6] = sy        # z
+        default_root[:, 3] = cr * cp * cy + sr * sp * sy  # w
+        default_root[:, 4] = sr * cp * cy - cr * sp * sy  # x
+        default_root[:, 5] = cr * sp * cy + sr * cp * sy  # y
+        default_root[:, 6] = cr * cp * sy - sr * sp * cy  # z
         # Small velocity perturbation — ±0.1 m/s: large perturbation causes instant falls
         default_root[:, 7:10]  = (torch.rand(n, 3, device=dev) - 0.5) * 0.2
         default_root[:, 10:13] = (torch.rand(n, 3, device=dev) - 0.5) * 0.2

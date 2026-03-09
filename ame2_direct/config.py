@@ -116,32 +116,40 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     )
 
     # ── Goal Command ─────────────────────────────────────────────────────────
+    # -- Fallen start (V41) --
+    fallen_start_ratio:  float = 0.5    # fraction of envs starting fallen
+    fallen_roll_range:   tuple = (-3.14, 3.14)  # full roll randomization
+    fallen_pitch_range:  tuple = (-0.5, 0.5)    # moderate pitch
+
     goal_pos_range_init: float = 0.8   # reduced from 1.5: easier early goal-reaching signal
     goal_pos_range_max:  float = 5.0
 
-    # ── Reward Weights ──────────────────────────────────────────────────────
-    # v14: Isaac Lab Navigation-style tanh position tracking (Hoeller et al. IROS 2022)
-    # Primary goal signal: 1-tanh(d/std) — non-zero everywhere, gradient up to 2*std
-    w_goal_coarse:          float = 1.5       # continuous distance gradient: 1-tanh(d/2.0), gradient up to d=4m
-    w_goal_fine:            float = 5.0       # 1-tanh(d/0.3): reward only when actually close (<0.5m)
-    w_position_tracking:    float = 0.0       # phase 2+: only fires when at goal (d<0.5m)
-    w_position_approach:    float = 0.0       # replaced by w_goal_coarse
-    w_upright_bonus:        float = 0.3       # stay upright
-    w_base_height:          float = 0.0       # disabled: upright_bonus already covers this
-    w_feet_air_time:        float = 1.0       # stepping gait
-    w_heading_tracking:     float = 0.0       # phase 2+: only fires d<0.5m
-    w_moving_to_goal:       float = 0.0       # disabled
-    w_vel_toward_goal:      float = 3.0       # PRIMARY signal: walk at 1m/s toward goal → +3.0/step
-    w_lin_vel_tracking:     float = 0.0       # disabled
-    w_anti_stagnation:      float = 0.5       # per-step: -1 when speed<0.2 AND d>0.5m
-    w_standing_at_goal:     float = 0.0       # phase 2+: only fires d<0.5m
-    w_early_termination:    float = -2.0      # small penalty — don't fear falling, explore!
-    w_undesired_events:     float = 0.0       # disabled
-    w_base_roll_rate:       float = 0.0       # disabled: natural during walking
-    w_joint_regularization: float = -0.001     # keep joints near default; prevents chaotic flailing
-    w_action_smoothness:    float = -0.005     # smooth action changes → stable gait bootstrap [AME-2 Table I]
+    # -- Reward Weights (V39) -------------------------------------------------
+    # Navigation rewards
+    w_goal_coarse:          float = 1.5       # coarse distance-to-goal signal
+    w_goal_fine:            float = 5.0       # fine near-goal signal (< 0.6m)
+    w_position_tracking:    float = 2.0       # Eq.(1) last 4s terminal tracking
+    w_heading_tracking:     float = 1.0       # Eq.(3) heading at goal
+    w_moving_to_goal:       float = 1.0       # Eq.(4) binary walk signal
+    w_vel_toward_goal:      float = 15.0       # directional velocity incentive
+    w_standing_at_goal:     float = 0.1       # Eq.(5) stand still at goal
+    # Stability rewards
+    w_upward:               float = 1.0       # robot_lab (1-g_z)^2: upright=4, fallen=0
+    w_base_height:          float = 0.0       # disabled
+    # Gait shaping penalties
+    w_lin_vel_z_l2:         float = -2.0      # penalize vertical bouncing
+    w_ang_vel_xy_l2:        float = -0.05     # penalize body pitch/roll rate
+    w_action_rate_l2:       float = -0.0005    # penalize action changes
+    w_joint_reg_l2:         float = -0.001    # penalize joint deviation from default
+    w_undesired_contacts:   float = -0.02     # 7 bad behaviors (slip/stumble/spin)
     w_link_contact_forces:  float = 0.0       # disabled
-    w_link_acceleration:    float = 0.0       # disabled
-    w_joint_pos_limits:     float = -1.0      # keep: only true hard limit (joint damage)
-    w_joint_vel_limits:     float = 0.0       # disabled: let robot move fast
-    w_joint_torque_limits:  float = 0.0       # disabled: let robot be strong
+    w_link_acceleration:    float = -0.00002  # penalize body flailing
+    w_joint_pos_limits:     float = -1.0      # hard joint position limits
+    w_joint_vel_limits:     float = -0.02     # joint overspeed
+    w_joint_torque_limits:  float = -0.02     # torque abuse
+    # Termination
+    w_early_termination:    float = -2.0      # penalty on terminated episodes
+    # Disabled (kept for backward compat, weight=0)
+    w_feet_air_time:        float = 0.0       # disabled: was penalizing normal walking
+    w_position_approach:    float = 0.0       # disabled: replaced by goal_coarse
+    w_anti_stagnation:      float = 0.0       # disabled: was too dominant early training
