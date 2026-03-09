@@ -14,7 +14,7 @@ V40 reward ok but robot still stands still (upward=3.99 dominates, moving_to_goa
 **fallen start + stronger locomotion**
 
 ### config.py
-- `w_upward`: 1.0 -> 0.2 (standing still no longer dominant)
+- `w_upward`: 1.0 (kept - essential for fallen recovery)
 - `w_vel_toward_goal`: 5.0 -> 15.0 (3x boost)
 - `w_goal_coarse`: 0.3 -> 1.5 (5x boost)
 - `w_moving_to_goal`: 0.1 -> 1.0 (10x boost)
@@ -26,7 +26,7 @@ V40 reward ok but robot still stands still (upward=3.99 dominates, moving_to_goa
 - 50% of envs start from random fallen pose (roll [-pi,pi], pitch [-0.5,0.5])
 - Fallen robots spawned 0.3m higher to avoid ground clipping
 - Full RPY quaternion composition (ZYX convention) replaces yaw-only
-- `bad_orientation` grace period: 1 step -> 100 steps (2s recovery time)
+- `bad_orientation` grace period: 1 step -> 500 steps (10s, enough for fallen recovery)
 
 ## v40 — 2026-03-09
 
