@@ -63,10 +63,12 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     )
 
     # ── Scene ────────────────────────────────────────────────────────────────
+    # replicate_physics=True matches IsaacLab's anymal_c example:
+    # enables collision filtering between envs so robots don't interact.
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=4800,                  # [stated Table VI]
-        env_spacing=3.0,
-        replicate_physics=False,
+        env_spacing=4.0,                # match anymal_c (was 3.0)
+        replicate_physics=True,
     )
 
     # ── Terrain ──────────────────────────────────────────────────────────────
@@ -150,14 +152,14 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     w_goal_fine:            float = 0.0
     w_vel_toward_goal:      float = 0.0
     w_position_approach:    float = 0.0
-    w_base_height:          float = 0.0
+    w_base_height:          float = 0.0      # V43l: removed, causes "stand still" exploit
     w_feet_air_time:        float = 0.0
     w_anti_stagnation:      float = 0.0
     w_lin_vel_z_l2:         float = 0.0      # not in paper Table I
     #
     # === Regularization (Paper Table I) ===
     w_early_termination:    float = -500.0   # Paper: -10/dτ = -10/0.02 = -500
-    w_undesired_contacts:   float = -1.0     # Paper: -1 per event
+    w_undesired_contacts:   float = -5.0     # Paper: -1, V43k: 5x to penalize knee crawling
     w_ang_vel_xy_l2:        float = -0.1     # Paper: Base Roll Rate -0.1
     w_joint_reg_l2:         float = -0.001   # Paper: Joint Regularization -0.001
     w_action_rate_l2:       float = -0.01    # Paper: Action Smoothness -0.01

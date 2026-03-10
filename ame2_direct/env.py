@@ -73,9 +73,21 @@ class AME2DirectEnv(DirectRLEnv):
         print(f"[ContactOrder] shanks: {_shank_names}")
         print(f"[ContactOrder] all_cs_ids={self._all_cs_ids}  (base+thigh+shank+foot, 13 total)")
 
+        # ── Print joint limits for debugging ──
+        _jlims = self._robot.data.joint_pos_limits
+        if _jlims.dim() == 3:
+            _jlims = _jlims[0]
+        _jdef = self._robot.data.default_joint_pos[0]
+        print(f"[JointLimits] {self._robot.joint_names}")
+        for _i, _jn in enumerate(self._robot.joint_names):
+            _lo, _hi = float(_jlims[_i, 0]), float(_jlims[_i, 1])
+            _dp = float(_jdef[_i])
+            print(f"  {_jn:20s}  lo={_lo:+.3f} ({_lo*57.3:+.0f}°)  hi={_hi:+.3f} ({_hi*57.3:+.0f}°)  default={_dp:+.3f}  95%=[{0.95*_lo:+.3f}, {0.95*_hi:+.3f}]")
+
         # Robot body indices for kinematics (thigh acc, foot vel)
         self._thigh_rb_ids, _   = self._robot.find_bodies(".*THIGH")
         self._foot_rb_ids, _    = self._robot.find_bodies(".*FOOT")
+        self._shank_rb_ids, _   = self._robot.find_bodies(".*SHANK")
 
         # ── Action buffers ──
         import gymnasium as gym
@@ -98,6 +110,9 @@ class AME2DirectEnv(DirectRLEnv):
 
         # ── Foot contact history for air-time reward (Isaac Lab anymal_c pattern) ──
         self._prev_foot_contact = torch.zeros(n, len(self._foot_cs_ids), device=dev, dtype=torch.bool)
+
+        # ── Thigh velocity buffer for acceleration termination ──
+        self._prev_thigh_vel = torch.zeros(n, len(self._thigh_rb_ids), 3, device=dev)
 
         # ── Terminated cache (set in _get_dones, used in _get_rewards) ──
         self._terminated = torch.zeros(n, device=dev, dtype=torch.bool)
@@ -414,8 +429,8 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_undesired_contacts * r_undes
         self._ep_sums["undesired_contacts"] += cfg.w_undesired_contacts * r_undes
 
-        # ang_vel_xy_l2 — penalize body pitch/roll angular velocity
-        r_roll = self._robot.data.root_ang_vel_b[:, :2].square().sum(1)
+        # base_roll_rate — Paper Table I: penalize body roll angular velocity
+        r_roll = self._robot.data.root_ang_vel_b[:, 0].square()
         rew += cfg.w_ang_vel_xy_l2 * r_roll
         self._ep_sums["ang_vel_xy_l2"] += cfg.w_ang_vel_xy_l2 * r_roll
 
@@ -480,59 +495,63 @@ class AME2DirectEnv(DirectRLEnv):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # V41: simplified terminations (robot_lab style)
-        # Only time_out + terrain_out_of_bounds. All behavior shaping via rewards.
-        # Removed: bad_orientation, base_collision, thigh_acc, stagnation
-        terrain_oob = self._terrain_out_of_bounds()
-        terminated = terrain_oob
+        # Paper Sec.IV-D.2 terminations (3 active):
+        # - bad_orientation: flipped/rolled robot
+        # - high_thigh_acceleration: crash detection
+        # - stagnation: stuck 5s with <0.5m displacement
+        # base_collision disabled: terrain_origin_z proxy unreliable on rough terrain
+        bad_o   = self._bad_orientation()
+        thigh_a = self._high_thigh_acceleration()
+        stag    = self._stagnation()
+
+        terminated = bad_o | thigh_a | stag
         truncated  = self.episode_length_buf >= self.max_episode_length - 1
 
         self._terminated = terminated
-        # Legacy logging (all zeros for disabled conditions)
-        z = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        self._term_bad_o  = z
-        self._term_base_c = z
-        self._term_thigh  = z
-        self._term_stag   = z
+        self._term_bad_o  = bad_o
+        self._term_thigh  = thigh_a
+        self._term_stag   = stag
         return terminated, truncated
 
     def _bad_orientation(self) -> torch.Tensor:
-        """[stated Sec.IV-D.2] — skip step 0 to avoid noisy physics right after reset."""
-        g = self._robot.data.projected_gravity_b
-        bad = (g[:,0].abs()>0.985) | (g[:,1].abs()>0.9) | (g[:,2]>0.0)
-        # V41: allow 100 steps (2s) for recovery from fallen start
-        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)  # V41: disabled
+        """Paper Sec.IV-D.2: terminate on bad orientation.
+
+        projected_gravity_b[:,2] < -1.0 for upright, = 0 at 90° tilt, > 0 inverted.
+        Threshold -0.5 ≈ 60° tilt — robot can't recover from this.
+        Grace period 20 steps (0.4s) for physics settling after reset.
+        """
+        g_z = self._robot.data.projected_gravity_b[:, 2]
+        return (g_z > -0.5) & (self.episode_length_buf > 20)
 
     def _base_collision(self) -> torch.Tensor:
         """Base collision: base height drops below terrain origin level.
 
-        The ContactSensor reports constraint/joint forces for articulated body bases
-        (not just external contacts), making force-based detection unreliable.
-        Use geometry: if base Z drops below terrain_origin_z the robot has collapsed.
-        Threshold of -0.1m is conservative to avoid false positives on rough terrain.
+        Detect when the robot's body has hit the ground (collapsed/fallen).
+        ANYmal-D standing height ≈ 0.5m above ground, so base < terrain_z - 0.3m
+        means the robot has collapsed significantly.
+        Grace period 50 steps to avoid false positives during physics settle.
         """
         base_z    = self._robot.data.root_pos_w[:, 2]
         terrain_z = self._terrain.env_origins[:, 2]
-        return (base_z - terrain_z) < -0.1
+        return ((base_z - terrain_z) < -0.3) & (self.episode_length_buf > 50)
 
     def _high_thigh_acceleration(self) -> torch.Tensor:
-        """Disabled during Phase 1 — robot must be free to explore aggressive movements.
+        """Paper Sec.IV-D.2: terminate on high thigh linear acceleration (crash detection).
 
-        Thigh_acc termination trains the robot to be overly conservative (fear-falling),
-        causing it to converge to standing-still local optimum. Re-enable in Phase 2
-        after locomotion is well-established.
+        Threshold 500 m/s² is for actual crashes (robot smashing into obstacles),
+        not normal joint jitter. Normal walking: ~5-50 m/s², crash: >500 m/s².
+        Grace period 50 steps (1s) to let random policy settle after reset.
         """
-        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        thigh_vel = self._robot.data.body_lin_vel_w[:, self._thigh_rb_ids, :]  # (N, 4, 3)
+        thigh_acc = (thigh_vel - self._prev_thigh_vel) / self.step_dt          # (N, 4, 3)
+        self._prev_thigh_vel = thigh_vel.clone()
+        acc_norm = torch.norm(thigh_acc, dim=-1).max(dim=1).values             # (N,)
+        return (acc_norm > 500.0) & (self.episode_length_buf > 50)
 
     def _stagnation(self) -> torch.Tensor:
-        """10s displacement < 0.5m AND goal dist > 0.5m.
-
-        Paper uses 5s, but early training needs more exploration time.
-        At 5s, 86% of episodes terminate before robot can attempt locomotion.
-        10s doubles the exploration window, allowing gait learning to begin.
-        """
+        """Paper Sec.IV-D.2: 5s displacement < 0.5m AND goal dist > 0.5m → terminate."""
         curr = self._robot.data.root_pos_w[:, :2]
-        win  = max(1, int(10.0 / self.step_dt))
+        win  = max(1, int(5.0 / self.step_dt))   # Paper: 5s window
 
         steps_since  = self.episode_length_buf - self._stag_step
         disp         = torch.norm(curr - self._stag_pos, dim=-1)
@@ -544,14 +563,7 @@ class AME2DirectEnv(DirectRLEnv):
             self._stag_step[upd] = self.episode_length_buf[upd].clone()
 
         d_xy = torch.norm(self._get_goal_xy_body(), dim=-1)
-        # Only trigger AFTER the full 5s window has elapsed.
-        # Without win_elapsed, disp≈0 at episode start → instant stagnation for any d_xy>1m.
-        # Use 0.5m threshold: matches the "at goal" condition (d_xy < 0.5m).
-        # Original paper uses 1m, but with goal_radius=0.8m all goals are <1m → never fires.
-        # Disabled for Phase 1 bootstrap: stagnation termination interrupts the robot
-        # before locomotion can emerge. Anti-stagnation REWARD still fires per-step.
-        # Re-enable after robot learns to walk (~2000 iterations).
-        return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        return win_elapsed & (disp < 0.5) & (d_xy > 0.5)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Reset
@@ -656,6 +668,7 @@ class AME2DirectEnv(DirectRLEnv):
         self._stag_step[env_ids]    = self.episode_length_buf[env_ids].clone()
         self._prev_nf_contact[env_ids]   = False
         self._prev_foot_contact[env_ids] = False
+        self._prev_thigh_vel[env_ids]    = 0.0
 
         # ── Reset navigation progress buffers ──
         d_xy_all = torch.norm(self._get_goal_xy_body(), dim=-1)
@@ -733,15 +746,14 @@ class AME2DirectEnv(DirectRLEnv):
         self.extras["log"]["Episode_Termination/bad_orientation"] = (
             getattr(self, "_term_bad_o", self.reset_terminated)[env_ids].sum().item() / n
         )
-        self.extras["log"]["Episode_Termination/base_collision"] = (
-            getattr(self, "_term_base_c", self.reset_terminated.new_zeros(self.num_envs))[env_ids].sum().item() / n
-        )
+        # base_collision disabled — terrain_origin_z proxy unreliable on rough terrain
         self.extras["log"]["Episode_Termination/thigh_acc"] = (
             getattr(self, "_term_thigh", self.reset_terminated.new_zeros(self.num_envs))[env_ids].sum().item() / n
         )
         self.extras["log"]["Episode_Termination/stagnation"] = (
             getattr(self, "_term_stag", self.reset_terminated.new_zeros(self.num_envs))[env_ids].sum().item() / n
         )
+        # terrain_oob removed — not a paper termination condition
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -860,6 +872,14 @@ class AME2DirectEnv(DirectRLEnv):
         sp     = torch.norm(foot_v[:, :, :2], dim=-1)
         in_c_f = torch.norm(foot_f, dim=-1) > 1.0
         pen += ((sp > 0.1) & in_c_f).any(1).float()
+
+        # 7. Self-collision proxy: any pair of shank links within 10cm
+        shank_pos = self._robot.data.body_pos_w[:, self._shank_rb_ids, :]  # (N, 4, 3)
+        n_sh = shank_pos.shape[1]
+        for i in range(n_sh):
+            for j in range(i + 1, n_sh):
+                dist_ij = torch.norm(shank_pos[:, i] - shank_pos[:, j], dim=-1)
+                pen += (dist_ij < 0.10).float()
 
         return pen
 

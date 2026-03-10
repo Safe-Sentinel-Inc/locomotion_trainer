@@ -92,7 +92,7 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
             clip_param=0.2,
             entropy_coef=0.004,          # Paper: decay 0.004→0.001
             num_learning_epochs=4,       # Paper Table VI (was 2)
-            num_mini_batches=3,          # Paper Table VI (was 48)
+            num_mini_batches=16,         # Paper: 3 (OOM on 3090 24GB, use 16)
             learning_rate=1e-3,
             schedule="adaptive",
             gamma=0.99,                  # Paper Table VI
@@ -198,7 +198,7 @@ def main():
     t0 = time.time()
 
     for it in range(it_start, args_cli.max_iterations):
-        runner.learn(num_learning_iterations=1, init_at_random_ep_len=(it == it_start))
+        runner.learn(num_learning_iterations=1, init_at_random_ep_len=False)
         update_curricula(rsl_env, runner, it)
 
         # Save checkpoint every 50 iters
