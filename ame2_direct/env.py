@@ -120,6 +120,7 @@ class AME2DirectEnv(DirectRLEnv):
             "undesired_contacts", "base_height", "feet_air_time", "ang_vel_xy_l2", "joint_reg_l2",
             "action_rate_l2", "link_contact", "link_acc",
             "jpos_lim", "jvel_lim", "jtau_lim",
+            "bias_goal", "anti_stall",
         ]}
 
         # -- Scale reward weights by dt (V40 fix) ---------------------
@@ -213,12 +214,14 @@ class AME2DirectEnv(DirectRLEnv):
 
         # Critic prop: base(45D) + critic_cmd(5D) + nav_extra(5D) = 55D
         # base(45D)      = prop_flat[:, :45]  (base_vel+ang_vel+grav+q+dq+act)
-        # critic_cmd(5D) = [x_rel, y_rel, sin(yaw), cos(yaw), t_remaining]  [stated Sec.IV-E.3]
+        # critic_cmd(5D) = [x_rel, y_rel, sin(d_yaw), cos(d_yaw), t_remaining]
+        # V42: d_yaw is SIGNED (critic needs full info, no .abs())
         # nav_extra(5D)  = privileged navigation signals unavailable to actor:
         #   [v_toward_goal, d_progress_rate, heading_align_rate, vel_w_x, vel_w_y]
         prop_base  = obs_policy[:, :45]
         goal_xy_b  = self._get_goal_xy_body()            # (N, 2)
-        d_yaw      = self._get_d_yaw()                   # (N,)
+        d_yaw_s    = self._get_d_yaw_signed()            # (N,) signed
+        d_yaw      = d_yaw_s.abs()                       # (N,) absolute for rewards/nav_extra
         t_rem      = (
             (self.max_episode_length - self.episode_length_buf).float()
             * self.step_dt / max(self.max_episode_length_s, 1.0)
@@ -226,8 +229,8 @@ class AME2DirectEnv(DirectRLEnv):
         critic_cmd  = torch.stack([
             goal_xy_b[:, 0].clamp(-5.0, 5.0),
             goal_xy_b[:, 1].clamp(-5.0, 5.0),
-            torch.sin(d_yaw),
-            torch.cos(d_yaw),
+            torch.sin(d_yaw_s),                          # V42: signed
+            torch.cos(d_yaw_s),                          # V42: signed
             t_rem,
         ], dim=-1)                                       # (N, 5)
 
@@ -354,23 +357,39 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_heading_tracking * r_head
         self._ep_sums["heading_tracking"] += cfg.w_heading_tracking * r_head
 
-        # 3. moving_to_goal Eq.(4) — v_min=0.3 m/s [stated], v_max=2.0 m/s [stated]
+        # 3. moving_to_goal Eq.(4) — v_min configurable (bootstrap=0.1, later 0.3)
         vel_xy  = self._robot.data.root_lin_vel_b[:, :2]
         vel_nrm = torch.norm(vel_xy, dim=1)
         to_goal = goal_xy_b / (d_xy.unsqueeze(1) + 1e-8)
         cos_t   = (vel_xy * to_goal).sum(1) / (vel_nrm + 1e-8)
-        r_move  = ((d_xy<0.5) | ((cos_t>0.5) & (vel_nrm>=0.3) & (vel_nrm<=2.0))).float()
+        v_min   = cfg.moving_to_goal_v_min
+        r_move  = ((d_xy<0.5) | ((cos_t>0.5) & (vel_nrm>=v_min) & (vel_nrm<=2.0))).float()
         rew += cfg.w_moving_to_goal * r_move
         self._ep_sums["moving_to_goal"] += cfg.w_moving_to_goal * r_move
 
-        # 4. vel_toward_goal (directional movement incentive)
+        # 4. vel_toward_goal (disabled in V42, replaced by bias_goal)
         v_proj = (vel_xy * to_goal).sum(1)
         r_vel  = torch.clamp(v_proj/2.0, -1.0, 1.0) * (d_xy>=0.5).float()
         rew += cfg.w_vel_toward_goal * r_vel
         self._ep_sums["vel_toward_goal"] += cfg.w_vel_toward_goal * r_vel
 
-        # anti_stagnation (disabled, weight=0)
+        # 5. bias_goal — 2209-style exploration reward (decays over training)
+        #    r = relu(cos_t) * clamp(vel_nrm/0.5, 0, 1) * (d_xy > 0.5)
+        #    Rewards any forward movement toward goal, proportional to speed
+        r_bias = (torch.relu(cos_t)
+                  * torch.clamp(vel_nrm / 0.5, 0.0, 1.0)
+                  * (d_xy > 0.5).float())
+        rew += cfg.w_bias_goal * r_bias
+        self._ep_sums["bias_goal"] += cfg.w_bias_goal * r_bias
+
+        # 6. anti_stall — 2209-style stalling penalty
+        #    r = -1.0 * (vel_nrm < 0.1) * (d_xy > 0.5)
         speed = torch.norm(vel_xy, dim=-1)
+        r_stall = -1.0 * (speed < 0.1).float() * (d_xy > 0.5).float()
+        rew += cfg.w_anti_stall * r_stall
+        self._ep_sums["anti_stall"] += cfg.w_anti_stall * r_stall
+
+        # anti_stagnation (legacy, disabled weight=0)
         r_anti_stag = -(speed < 0.2).float() * (d_xy > 0.5).float()
         rew += cfg.w_anti_stagnation * r_anti_stag
         self._ep_sums["anti_stagnation"] += cfg.w_anti_stagnation * r_anti_stag
@@ -735,22 +754,34 @@ class AME2DirectEnv(DirectRLEnv):
         )
 
     def _get_actor_cmd(self) -> torch.Tensor:
-        """[d_xy, sin(bearing), cos(bearing)] — bearing-to-goal in body frame.
+        """[clip(d_xy, 2.0), sin(d_yaw), cos(d_yaw)] — AME-2 compressed command.
 
-        bearing = atan2(gxy_b[1], gxy_b[0]): direction from robot forward to goal.
-        This is independent of goal_heading so it always points toward the goal
-        position regardless of heading curriculum state. The final-heading signal
-        reaches the actor only through the value function (critic sees goal_heading
-        explicitly via critic_cmd).
+        d_yaw = goal_heading - robot_yaw (signed heading error).
+        When d_xy > 2m, yaw command is randomized for actor (AME-2 Sec.IV-D trick):
+        the actor cannot rely on heading for navigation when far from goal,
+        forcing it to learn walking from the value function (critic has full x_rel, y_rel).
         """
         gxy     = self._get_goal_xy_body()          # (N, 2) in body frame
         d_xy    = torch.norm(gxy, dim=1)
-        bearing = torch.atan2(gxy[:, 1], gxy[:, 0]) # angle from forward to goal
-        return torch.stack([d_xy.clamp(max=2.0), bearing.sin(), bearing.cos()], dim=1)
+        d_yaw   = self._get_d_yaw_signed()          # (N,) signed heading error
+
+        # When far from goal, randomize actor's yaw command (critic keeps true value)
+        far_mask = d_xy > 2.0
+        d_yaw_cmd = d_yaw.clone()
+        n_far = far_mask.sum().item()
+        if n_far > 0:
+            d_yaw_cmd[far_mask] = (torch.rand(int(n_far), device=self.device) * 2 * math.pi - math.pi)
+
+        return torch.stack([d_xy.clamp(max=2.0), d_yaw_cmd.sin(), d_yaw_cmd.cos()], dim=1)
+
+    def _get_d_yaw_signed(self) -> torch.Tensor:
+        """Signed heading error: goal_heading - robot_yaw, wrapped to [-pi, pi]."""
+        err = self._goal_heading - self._get_yaw()
+        return torch.atan2(torch.sin(err), torch.cos(err))
 
     def _get_d_yaw(self) -> torch.Tensor:
-        err = self._goal_heading - self._get_yaw()
-        return torch.atan2(torch.sin(err), torch.cos(err)).abs()
+        """Absolute heading error [0, pi] — used for reward computation."""
+        return self._get_d_yaw_signed().abs()
 
     def _t_mask(self, T: float) -> torch.Tensor:
         t_left = (self.max_episode_length - self.episode_length_buf).float() * self.step_dt

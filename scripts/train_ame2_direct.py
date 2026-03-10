@@ -1,18 +1,19 @@
-"""AME-2 Phase 1 Teacher Training — Isaac Lab Direct Workflow.
+"""AME-2 Phase 1 Teacher Training — V42 Unified Plan.
 
 3-5x faster than manager-based env (no Python manager overhead).
 Based on anymal_c_env.py Direct Workflow pattern + IsaacLab RSL-RL train.py pattern.
 
+V42: AME-2 command + 2209 bias/stall + Risky Terrains curriculum
+     Phase 1 bootstrap: no fallen start, no upright reward.
+
 Usage (single GPU):
-    /path/to/python scripts/train_ame2_direct.py --num_envs 4096 --headless
+    /path/to/python scripts/train_ame2_direct.py --num_envs 2048 --headless
 
-Usage (2 GPUs independently):
+Usage (multi-GPU, different seeds):
     CUDA_VISIBLE_DEVICES=0 /path/to/python scripts/train_ame2_direct.py \
-        --num_envs 4096 --seed 42 --log_dir logs_direct/gpu0 --headless &
-    CUDA_VISIBLE_DEVICES=1 /path/to/python scripts/train_ame2_direct.py \
-        --num_envs 4096 --seed 43 --log_dir logs_direct/gpu1 --headless &
-
-Paper: arXiv:2601.08485 — trained with Isaac Gym + RSL-RL PPO, 8× RTX 4090, ~60 GPU-days.
+        --num_envs 2048 --seed 42 --log_dir logs_v42/gpu0 --headless &
+    CUDA_VISIBLE_DEVICES=3 /path/to/python scripts/train_ame2_direct.py \
+        --num_envs 2048 --seed 43 --log_dir logs_v42/gpu3 --headless &
 """
 
 from __future__ import annotations
@@ -26,16 +27,16 @@ import isaacsim  # noqa: F401 — initializes the Isaac Sim app
 from isaaclab.app import AppLauncher
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="AME-2 Direct Env Teacher Training (Phase 1)")
+parser = argparse.ArgumentParser(description="AME-2 V42 Teacher Training (Phase 1)")
 AppLauncher.add_app_launcher_args(parser)
-parser.add_argument("--num_envs",         type=int,   default=4096,
+parser.add_argument("--num_envs",         type=int,   default=2048,
                     help="Number of parallel environments")
 parser.add_argument("--max_iterations",   type=int,   default=80_000,
                     help="Total PPO training iterations [stated: 80k]")
-parser.add_argument("--num_mini_batches", type=int,   default=96,  # batch≈512, fits 32GB GPU
-                    help="Mini-batches per PPO update [stated Table VI: 4]")
+parser.add_argument("--num_mini_batches", type=int,   default=48,
+                    help="Mini-batches per PPO update")
 parser.add_argument("--seed",             type=int,   default=42)
-parser.add_argument("--log_dir",          type=str,   default="logs_direct")
+parser.add_argument("--log_dir",          type=str,   default="logs_v42")
 parser.add_argument("--resume",           type=str,   default=None,
                     help="Checkpoint .pt path to resume from")
 args_cli, _ = parser.parse_known_args()
@@ -86,7 +87,7 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
         num_steps_per_env=24,            # stated Table VI
         max_iterations=args_cli.max_iterations,
         save_interval=999999,  # disabled: outer loop handles checkpointing
-        experiment_name="ame2_direct_phase1",
+        experiment_name="ame2_v42_phase1",
         empirical_normalization=False,
         policy=RslRlPpoActorCriticCfg(
             init_noise_std=1.0,
@@ -98,97 +99,112 @@ def make_runner_cfg(seed: int, num_mini_batches: int, log_dir: str, device: str)
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.005,          # v32: lowered 0.02→0.005; high entropy + adaptive LR
-                                         # caused std explosion (1.0→2.05); 0.005 lets policy gradient
-                                         # dominate over entropy regularization once gait is learned
-            num_learning_epochs=2,       # reduced: 4→2 to limit gradient steps per rollout
-            num_mini_batches=num_mini_batches,  # use 96+ to keep batch<512 → fits 32GB GPU
+            entropy_coef=0.005,
+            num_learning_epochs=2,
+            num_mini_batches=num_mini_batches,
             learning_rate=1e-3,
             schedule="adaptive",
             gamma=0.99,                  # stated Table VI
             lam=0.95,                    # stated Table VI
-            desired_kl=0.01,             # v32: tightened 0.02→0.01; prevents adaptive LR from
-                                         # increasing LR when KL is small (noise regime), breaks
-                                         # the positive feedback loop: high_std→low_KL→higher_LR→higher_std
+            desired_kl=0.01,
             max_grad_norm=1.0,
         ),
-        # obs_groups required by rsl_rl runner; AME2ActorCritic uses full TensorDict directly
         obs_groups={
-            "policy": ["prop"],          # default actor_critic constructed with 48D prop
-            "critic": ["prop"],          # replaced post-hoc by AME2ActorCritic
+            "policy": ["prop"],
+            "critic": ["prop"],
         },
     )
     return cfg.to_dict()
 
 
-# ── Curriculum state ──────────────────────────────────────────────────────────
+# ── V42 Curriculum State ─────────────────────────────────────────────────────
 
-_stag_ema        = [0.5]
-_goal_fine_ema   = [0.0]    # EMA of goal_fine: require sustained high before expanding
-_goal_radius     = [1.2]    # start at 1.2m (proven working distance)
-_last_expand_it  = [-100]   # last iteration goal_r was expanded (rate limiter)
-_it_start_ref    = [0]      # set in main() before loop; used for local-iter entropy decay
-_GOAL_R_MIN      = 0.8
-_GOAL_R_MAX      = 5.0
-_GOAL_R_STEP     = 0.2      # +0.2m per expansion event
-_GOAL_R_COOLDOWN = 600      # cooldown 400→600: prevent lucky spike from triggering expansion
-# v32: entropy_coef is now fixed at 0.005 in make_runner_cfg; no decay needed.
-# Previously: decay 0.02→0.007 over 3000 iters, but adaptive LR counteracted it,
-# causing std explosion to 2.05.  Fixed low entropy lets policy gradient win.
-_ENTROPY_START   = 0.005    # unused — kept for resume compat; entropy now fixed in cfg
-_ENTROPY_END     = 0.005    # same value → no-op decay
-_ENTROPY_DECAY_ITERS = 1    # effectively instant
+# Goal radius curriculum levels (expand only when success is stable)
+_GOAL_R_LEVELS = [0.8, 1.2, 1.8, 2.5, 3.5, 5.0]
+_goal_r_idx     = [0]           # current level index
+_goal_radius    = [0.8]         # current goal radius
+
+# Success tracking for goal radius expansion
+_success_ema    = [0.0]         # EMA of success rate (position_tracking > threshold)
+_pos_track_ema  = [0.0]         # EMA of position_tracking reward
+
+# bias_goal decay state
+_bias_active    = [True]
+_BIAS_DECAY_ITER = 3000         # decay bias_goal after this many iterations
+
+# v_min curriculum
+_V_MIN_BOOTSTRAP = 0.1          # easy threshold for first 3000 iters
+_V_MIN_FULL      = 0.3          # paper value after bootstrap
+_V_MIN_SWITCH_ITER = 3000
+
+# Heading/noise curriculum
+_HEADING_RAMP_FRAC = 0.2        # ramp heading curriculum over 20% of training
+_NOISE_RAMP_FRAC   = 0.2        # ramp perception noise over 20% of training
+
+# Goal radius expansion criteria
+_GOAL_R_COOLDOWN     = 400      # min iters between expansions
+_last_expand_it      = [-400]   # allow first expansion after warmup
+_SUCCESS_EMA_THRESH  = 0.6      # require success EMA > 0.6 to expand
+_POS_TRACK_RISING    = [0.0]    # previous pos_track_ema for rising check
 
 
 def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: int) -> None:
-    """Update all curricula each iteration.
+    """V42 unified curriculum — all scheduling in one place."""
+    env = env_direct._env  # underlying AME2DirectEnv
+    cfg = env.cfg
+    max_it = args_cli.max_iterations
 
-    Curriculum design:
-      1. Heading:   face-goal → gradual random over 60% of training
-                    (user request: learn walk first, then learn to turn)
-      2. Goal dist: expand +0.2m only when stag_ema<0.25 AND 200-iter cooldown
-                    (prevents rapid jump from stagnation noise)
-      3. Perception noise: 0→max over first 20% iters [stated]
-    """
-    # Heading curriculum: ramp over 60% of training (not 20%) — give robot time to
-    # learn goal-directed walking before it must also learn to turn from random yaw.
-    heading_frac = min(1.0, it / max(1, int(0.6 * args_cli.max_iterations)))
-    env_direct.set_scan_noise_scale(
-        min(1.0, it / max(1, int(0.2 * args_cli.max_iterations)))
-    )
+    # ── 1. Heading curriculum: 0→1 over first 20% iters ──
+    heading_frac = min(1.0, it / max(1, int(_HEADING_RAMP_FRAC * max_it)))
     env_direct.set_heading_curriculum(heading_frac)
 
-    # Update stagnation EMA and goal_fine EMA
-    ep_log  = runner.env.extras.get("log", {})
-    stag    = float(ep_log.get("Episode_Termination/stagnation", 0.5))
-    _stag_ema[0] = 0.05 * stag + 0.95 * _stag_ema[0]
-    goal_fine_avg = float(ep_log.get("Episode_Reward/goal_fine", 0.0))
-    _goal_fine_ema[0] = 0.02 * goal_fine_avg + 0.98 * _goal_fine_ema[0]  # slow EMA: ~50-iter window
+    # ── 2. Perception noise: 0→max over first 20% iters ──
+    noise_scale = min(1.0, it / max(1, int(_NOISE_RAMP_FRAC * max_it)))
+    env_direct.set_scan_noise_scale(noise_scale)
 
-    # Goal distance curriculum — expand only when SUSTAINED high goal_fine (EMA > 5.0).
-    # Previous bug: instantaneous goal_fine_avg > 3.0 was satisfied by lucky spikes from
-    # noisy policy (std=1.0), causing premature expansion and policy collapse.
-    # Fix: require goal_fine_ema > 5.0 (EMA over ~50 iters) so robot must consistently
-    # reach goals before the radius grows.  Cooldown also extended 400→600.
+    # ── 3. moving_to_goal v_min: 0.1 → 0.3 at 3000 iter ──
+    if it < _V_MIN_SWITCH_ITER:
+        cfg.moving_to_goal_v_min = _V_MIN_BOOTSTRAP
+    else:
+        cfg.moving_to_goal_v_min = _V_MIN_FULL
+
+    # ── 4. bias_goal decay: when success EMA > 0.5 or after 3000 iters ──
+    ep_log = runner.env.extras.get("log", {})
+    pos_track = float(ep_log.get("Episode_Reward/position_tracking", 0.0))
+    _pos_track_ema[0] = 0.05 * pos_track + 0.95 * _pos_track_ema[0]
+
+    # Success = position_tracking EMA is significant (robot reaching goals)
+    _success_ema[0] = 0.05 * (1.0 if pos_track > 0.5 else 0.0) + 0.95 * _success_ema[0]
+
+    if _bias_active[0]:
+        if _success_ema[0] > 0.5 or it >= _BIAS_DECAY_ITER:
+            # Linearly decay bias_goal weight to 0 over 500 iters
+            decay_start = max(it, _BIAS_DECAY_ITER)
+            decay_progress = min(1.0, (it - decay_start + 500) / 500)
+            # Note: cfg weights are already dt-scaled, so we need the dt-scaled version
+            raw_bias = 3.0 * env.step_dt  # original dt-scaled weight
+            cfg.w_bias_goal = raw_bias * max(0.0, 1.0 - decay_progress)
+            if cfg.w_bias_goal <= 0.0:
+                _bias_active[0] = False
+                cfg.w_bias_goal = 0.0
+                print(f"[V42 Curriculum] it={it}: bias_goal decayed to 0")
+
+    # ── 5. Goal radius curriculum: expand when success is stable ──
     env_direct.set_goal_radius(_goal_radius[0])
     cooldown_ok = (it - _last_expand_it[0]) >= _GOAL_R_COOLDOWN
-    if _stag_ema[0] < 0.25 and _goal_fine_ema[0] > 5.0 and _goal_radius[0] < _GOAL_R_MAX and cooldown_ok:
-        _goal_radius[0] = min(_goal_radius[0] + _GOAL_R_STEP, _GOAL_R_MAX)
+    pos_rising = _pos_track_ema[0] > _POS_TRACK_RISING[0] - 0.01  # not declining
+    _POS_TRACK_RISING[0] = _pos_track_ema[0]
+
+    if (_success_ema[0] > _SUCCESS_EMA_THRESH
+            and pos_rising
+            and cooldown_ok
+            and _goal_r_idx[0] < len(_GOAL_R_LEVELS) - 1):
+        _goal_r_idx[0] += 1
+        _goal_radius[0] = _GOAL_R_LEVELS[_goal_r_idx[0]]
         _last_expand_it[0] = it
-        print(f"[GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  goal_fine_ema={_goal_fine_ema[0]:.1f}")
-
-    # Entropy decay: 0.02 → 0.007 over first 3000 local iters.
-    # Safe at iter 1000+: policy already walks, decay won't cause locomotion collapse.
-    # Previous fix (fixed 0.02) was correct for early training (<500 iter) but now
-    # std=1.1 is preventing precision goal-reaching — entropy must decay to allow
-    # std to converge to ~0.5-0.7 where 0.3m fine-zone navigation becomes reliable.
-    local_it = max(0, it - _it_start_ref[0])
-    entropy_target = max(_ENTROPY_END,
-                         _ENTROPY_START - (_ENTROPY_START - _ENTROPY_END)
-                         * min(1.0, local_it / _ENTROPY_DECAY_ITERS))
-    runner.alg.entropy_coef = entropy_target
-
-    # (lin_vel_tracking replaced by tanh position tracking in v14 — no decay needed)
+        env_direct.set_goal_radius(_goal_radius[0])
+        print(f"[V42 GoalCurr] it={it}: goal_radius→{_goal_radius[0]:.1f}m  "
+              f"success_ema={_success_ema[0]:.2f}  pos_track_ema={_pos_track_ema[0]:.3f}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -199,17 +215,16 @@ def main():
 
     # ── Env ──
     policy_cfg = anymal_d_policy_cfg()     # ANYmal-D PolicyConfig (map_h=14, map_w=36)
-    policy_cfg.d_prop_critic = 55          # Extended critic: +5D nav signals (see env.py)
+    policy_cfg.d_prop_critic = 55          # Extended critic: +5D nav signals
     env_cfg = AME2DirectEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    _goal_radius[0] = env_cfg.goal_pos_range_init
     env = AME2DirectEnv(cfg=env_cfg)
 
     # ── Wrapper: provides TensorDict obs + 5-tuple step() for RSL-RL runner ──
     rsl_env = AME2DirectWrapper(env, device=device)
 
     # ── AME-2 network ──
-    # obs=None is safe: AME2ActorCritic.__init__ does not inspect obs
-    # obs_groups={}: runner routes TensorDict obs directly to actor_critic
     ame2_net = AME2ActorCritic(
         obs=None,
         obs_groups={},
@@ -223,90 +238,87 @@ def main():
     runner_cfg = make_runner_cfg(args_cli.seed, args_cli.num_mini_batches,
                                  args_cli.log_dir, device)
     runner = OnPolicyRunner(rsl_env, runner_cfg, args_cli.log_dir, device=device)
-    # Replace default MLP actor_critic with AME2ActorCritic (post-hoc, before any training)
-    # NOTE: RSL-RL PPO stores the policy as self.policy (NOT self.actor_critic)
     runner.alg.policy = ame2_net
     runner.alg.optimizer = torch.optim.Adam(ame2_net.parameters(), lr=1e-3)
 
     # ── Resume ──
+    it_start = 0
     if args_cli.resume:
         print(f"[Resume] {args_cli.resume}")
         ckpt = torch.load(args_cli.resume, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
         ame2_net.load_state_dict(state, strict=False)
-        # Restore curriculum state (missing in old checkpoints → keep defaults)
         if "goal_radius" in ckpt:
             _goal_radius[0] = float(ckpt["goal_radius"])
-            print(f"[Resume] goal_radius restored: {_goal_radius[0]:.1f}m")
-        if "stag_ema" in ckpt:
-            _stag_ema[0] = float(ckpt["stag_ema"])
-            print(f"[Resume] stag_ema restored: {_stag_ema[0]:.3f}")
-        if "goal_fine_ema" in ckpt:
-            _goal_fine_ema[0] = float(ckpt["goal_fine_ema"])
-            print(f"[Resume] goal_fine_ema restored: {_goal_fine_ema[0]:.2f}")
-        if "last_expand_it" in ckpt:
-            _last_expand_it[0] = int(ckpt["last_expand_it"])
-            print(f"[Resume] last_expand_it restored: {_last_expand_it[0]}")
-        # Reset action noise std to 0.5: v32 fix — previous std=1.0 reset caused std explosion
-        # (1.0→2.05 by iter 2700) when combined with adaptive LR and entropy_coef=0.02.
-        # std=0.5 is sufficient exploration while keeping smoothness penalty manageable.
+            # Find matching level index
+            for i, r in enumerate(_GOAL_R_LEVELS):
+                if r >= _goal_radius[0] - 0.01:
+                    _goal_r_idx[0] = i
+                    break
+            print(f"[Resume] goal_radius={_goal_radius[0]:.1f}m (level {_goal_r_idx[0]})")
+        if "success_ema" in ckpt:
+            _success_ema[0] = float(ckpt["success_ema"])
+        if "pos_track_ema" in ckpt:
+            _pos_track_ema[0] = float(ckpt["pos_track_ema"])
+        if "bias_active" in ckpt:
+            _bias_active[0] = bool(ckpt["bias_active"])
         with torch.no_grad():
             ame2_net.std.fill_(0.5)
-        print(f"[Resume] loaded (std reset to 1.0)")
-
-
-    # ── Speed benchmark: print iter time before training ──
-    print(f"\n[AME-2 Direct] env={args_cli.num_envs}, iters={args_cli.max_iterations}, "
-          f"seed={args_cli.seed}, device={device}")
-    print(f"  Log: {args_cli.log_dir}\n")
-
-    t0 = time.time()
-
-    # Resume: detect starting iteration from latest checkpoint
-    it_start = 0
-    if args_cli.resume:
         import re
         m = re.search(r"model_(\d+)\.pt", args_cli.resume)
         if m:
             it_start = int(m.group(1)) + 1
-            print(f"[Resume] Resuming from iteration {it_start}")
+            print(f"[Resume] from iteration {it_start}")
 
-    _it_start_ref[0] = it_start  # expose to update_curricula for local-iter entropy decay
+    # ── Print config ──
+    print(f"\n[AME-2 V42] env={args_cli.num_envs}, iters={args_cli.max_iterations}, "
+          f"seed={args_cli.seed}, device={device}")
+    print(f"  episode_length={env_cfg.episode_length_s}s  fallen_start={env_cfg.fallen_start_ratio}")
+    print(f"  Main rewards: pos_track={100.0} head_track={50.0} move={5.0} stand={5.0} bias={3.0} stall={2.5}")
+    print(f"  Log: {args_cli.log_dir}\n")
+
+    t0 = time.time()
 
     for it in range(it_start, args_cli.max_iterations):
         runner.learn(num_learning_iterations=1, init_at_random_ep_len=(it == it_start))
         update_curricula(rsl_env, runner, it)
 
-        # Save checkpoint every 25 iters (outer loop manages, not RSL-RL internal)
+        # Save checkpoint every 25 iters
         if it % 25 == 0:
             ckpt_path = os.path.join(args_cli.log_dir, f"model_{it}.pt")
             torch.save({
                 "model_state_dict": ame2_net.state_dict(),
                 "goal_radius": _goal_radius[0],
-                "stag_ema": _stag_ema[0],
-                "goal_fine_ema": _goal_fine_ema[0],
-                "last_expand_it": _last_expand_it[0],
+                "goal_r_idx": _goal_r_idx[0],
+                "success_ema": _success_ema[0],
+                "pos_track_ema": _pos_track_ema[0],
+                "bias_active": _bias_active[0],
             }, ckpt_path)
 
+        # Logging every 50 iters
         if it % 50 == 0:
-            elapsed   = time.time() - t0
-            it_time   = elapsed / max(it - it_start + 1, 1)
-            eta_days  = it_time * (args_cli.max_iterations - it) / 86400
-            ep_log = runner.env.extras.get("log", {})
-            goal_c = float(ep_log.get("Episode_Reward/goal_coarse", 0.0))
-            goal_f = float(ep_log.get("Episode_Reward/goal_fine", 0.0))
-            stag_r = float(ep_log.get("Episode_Termination/stagnation", 1.0))
+            elapsed = time.time() - t0
+            it_time = elapsed / max(it - it_start + 1, 1)
+            eta_h   = it_time * (args_cli.max_iterations - it) / 3600
+
+            ep_log  = runner.env.extras.get("log", {})
+            pos_t   = float(ep_log.get("Episode_Reward/position_tracking", 0.0))
+            move    = float(ep_log.get("Episode_Reward/moving_to_goal", 0.0))
+            bias    = float(ep_log.get("Episode_Reward/bias_goal", 0.0))
+            stall   = float(ep_log.get("Episode_Reward/anti_stall", 0.0))
+            head    = float(ep_log.get("Episode_Reward/heading_tracking", 0.0))
+
             print(
                 f"[it {it:6d}] "
                 f"terrain={rsl_env.get_terrain_level():.2f}  "
-                f"stag_ema={_stag_ema[0]:.3f}  "
                 f"goal_r={_goal_radius[0]:.1f}m  "
-                f"goal_c={goal_c:.1f}  goal_f={goal_f:.2f}  gf_ema={_goal_fine_ema[0]:.2f}  "
-                f"stag_rate={stag_r:.2f}  ent={runner.alg.entropy_coef:.4f}  "
-                f"iter={it_time:.1f}s  ETA={eta_days:.1f}d"
+                f"pos_t={pos_t:.3f}  move={move:.3f}  bias={bias:.3f}  "
+                f"stall={stall:.3f}  head={head:.3f}  "
+                f"succ_ema={_success_ema[0]:.2f}  v_min={env.cfg.moving_to_goal_v_min:.1f}  "
+                f"iter={it_time:.1f}s  ETA={eta_h:.1f}h"
             )
 
-    print("[AME-2 Direct] Done!")
+    print("[AME-2 V42] Done!")
     simulation_app.close()
 
 
