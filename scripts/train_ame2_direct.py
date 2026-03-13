@@ -34,6 +34,20 @@ parser.add_argument("--seed",             type=int,   default=42)
 parser.add_argument("--log_dir",          type=str,   default="logs_v43")
 parser.add_argument("--resume",           type=str,   default=None,
                     help="Checkpoint .pt path to resume from")
+# ── Reward weight overrides (all w_* from config, auto-registered) ──
+for _wn in [
+    "w_position_tracking", "w_arrival", "w_heading_tracking",
+    "w_moving_to_goal", "w_standing_at_goal",
+    "w_bias_goal", "w_anti_stall", "w_upward",
+    "w_goal_coarse", "w_goal_fine",
+    "w_vel_toward_goal", "w_position_approach",
+    "w_base_height", "w_feet_air_time", "w_anti_stagnation", "w_lin_vel_z_l2",
+    "w_early_termination", "w_undesired_contacts",
+    "w_ang_vel_xy_l2", "w_joint_reg_l2", "w_action_rate_l2",
+    "w_link_contact_forces", "w_link_acceleration",
+    "w_joint_pos_limits", "w_joint_vel_limits", "w_joint_torque_limits",
+]:
+    parser.add_argument(f"--{_wn}", type=float, default=None)
 args_cli, _ = parser.parse_known_args()
 
 if not hasattr(args_cli, "headless"):
@@ -78,7 +92,7 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
         num_steps_per_env=24,            # Paper Table VI
         max_iterations=args_cli.max_iterations,
         save_interval=999999,
-        experiment_name="ame2_v43",
+        experiment_name="ame2_v46",
         empirical_normalization=False,
         policy=RslRlPpoActorCriticCfg(
             init_noise_std=1.0,
@@ -90,7 +104,7 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.004,          # Paper: decay 0.004→0.001
+            entropy_coef=0.004,          # Paper Table VI: 0.004→0.001 (decay handled by update_curricula)
             num_learning_epochs=4,       # Paper Table VI (was 2)
             num_mini_batches=16,         # Paper: 3 (OOM on 3090 24GB, use 16)
             learning_rate=1e-3,
@@ -132,7 +146,7 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     noise_scale = min(1.0, it / max(1, int(_NOISE_RAMP_FRAC * max_it)))
     env_direct.set_scan_noise_scale(noise_scale)
 
-    # ── 3. Entropy decay: 0.004 → 0.001 linearly ──
+    # ── 3. Entropy decay: 0.004 → 0.001 linearly (Paper Table VI) ──
     frac = min(1.0, it / max(1, max_it))
     entropy = _ENTROPY_START + (_ENTROPY_END - _ENTROPY_START) * frac
     runner.alg.entropy_coef = entropy
@@ -149,6 +163,13 @@ def main():
     policy_cfg.d_prop_critic = 55
     env_cfg = AME2DirectEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    # ── Apply CLI reward overrides (before env __init__ scales by dt) ──
+    for attr_name in dir(env_cfg):
+        if attr_name.startswith('w_') and isinstance(getattr(env_cfg, attr_name), (int, float)):
+            val = getattr(args_cli, attr_name, None)
+            if val is not None:
+                setattr(env_cfg, attr_name, val)
+                print(f"  [Override] {attr_name} = {val}")
     env = AME2DirectEnv(cfg=env_cfg)
 
     rsl_env = AME2DirectWrapper(env, device=device)
@@ -191,8 +212,10 @@ def main():
     print(f"  episode={env_cfg.episode_length_s}s  "
           f"goal=[{env_cfg.goal_pos_range_min}, {env_cfg.goal_pos_range_max}]m  "
           f"v_min={env_cfg.moving_to_goal_v_min}")
-    print(f"  PPO: epochs=4  mini_batches=3  entropy=0.004→0.001")
-    print(f"  Rewards: pos=100 head=50 move=5 stand=5  (paper Table I)")
+    print(f"  PPO: epochs=4  mini_batches=16  entropy=0.004→0.001")
+    print(f"  Rewards (pre-dt): pos={env_cfg.w_position_tracking:.0f} arrival={env_cfg.w_arrival:.0f} "
+          f"vel={env_cfg.w_vel_toward_goal:.0f} move={env_cfg.w_moving_to_goal:.0f} "
+          f"appr={env_cfg.w_position_approach:.0f} undes={env_cfg.w_undesired_contacts:.0f}")
     print(f"  Log: {args_cli.log_dir}\n")
 
     t0 = time.time()
@@ -220,6 +243,8 @@ def main():
             move    = float(ep_log.get("Episode_Reward/moving_to_goal", 0.0))
             stand   = float(ep_log.get("Episode_Reward/standing_at_goal", 0.0))
             head    = float(ep_log.get("Episode_Reward/heading_tracking", 0.0))
+            appr    = float(ep_log.get("Episode_Reward/position_approach", 0.0))
+            vtg     = float(ep_log.get("Episode_Reward/vel_toward_goal", 0.0))
             dxy     = float(ep_log.get("Episode_Goal/terminal_dxy_mean", 0.0))
             succ05  = float(ep_log.get("Episode_Success/pos_0.50m", 0.0))
             succ100 = float(ep_log.get("Episode_Success/pos_1.00m", 0.0))
@@ -229,6 +254,7 @@ def main():
                 f"terrain={rsl_env.get_terrain_level():.2f}  "
                 f"dxy={dxy:.2f}m  succ@0.5={succ05:.2f}  succ@1.0={succ100:.2f}  "
                 f"pos_t={pos_t:.3f}  move={move:.3f}  stand={stand:.3f}  head={head:.3f}  "
+                f"appr={appr:.3f}  vtg={vtg:.3f}  "
                 f"iter={it_time:.1f}s  ETA={eta_h:.1f}h"
             )
 
