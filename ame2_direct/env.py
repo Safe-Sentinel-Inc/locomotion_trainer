@@ -975,11 +975,46 @@ class AME2DirectEnv(DirectRLEnv):
 # RSL-RL / AME2ActorCritic wrapper (no MappingNet/WTA — GT map only)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Obs packing/unpacking for rsl_rl flat-tensor storage ──────────────────
+# Layout: [prop(48) | map_flat(1512) | critic_prop(55) | map_teacher_flat(1512) | contact(13)]
+# Total = 3140 per env
+_OBS_SLICES = {
+    "prop":         (0, 48),
+    "map":          (48, 48 + 1512),
+    "critic_prop":  (48 + 1512, 48 + 1512 + 55),
+    "map_teacher":  (48 + 1512 + 55, 48 + 1512 + 55 + 1512),
+    "contact":      (48 + 1512 + 55 + 1512, 48 + 1512 + 55 + 1512 + 13),
+}
+OBS_FLAT_DIM = 48 + 1512 + 55 + 1512 + 13  # 3140
+
+
+def pack_obs(obs_dict: dict, num_envs: int) -> torch.Tensor:
+    """Pack structured obs dict into flat (N, 3140) tensor."""
+    flat = torch.empty(num_envs, OBS_FLAT_DIM, device=obs_dict["prop"].device)
+    for key, (lo, hi) in _OBS_SLICES.items():
+        flat[:, lo:hi] = obs_dict[key].reshape(num_envs, -1)
+    return flat
+
+
+def unpack_obs(flat: torch.Tensor) -> dict:
+    """Unpack flat (N, 3140) tensor back into structured obs dict."""
+    N = flat.shape[0]
+    d = {}
+    for key, (lo, hi) in _OBS_SLICES.items():
+        chunk = flat[:, lo:hi]
+        if key in ("map", "map_teacher"):
+            d[key] = chunk.reshape(N, 3, 14, 36)
+        else:
+            d[key] = chunk
+    d["policy"] = d["prop"]  # alias for backward compat
+    return d
+
+
 class AME2DirectWrapper:
     """Thin wrapper around AME2DirectEnv for rsl_rl OnPolicyRunner + AME2ActorCritic.
 
     Implements rsl_rl.env.VecEnv interface:
-      - get_observations() → TensorDict
+      - get_observations() → (ObsDict, extras)
       - step(actions) → (obs, rewards, dones, extras)  [4-tuple]
       - episode_length_buf, num_envs, num_actions, max_episode_length, device, cfg
 
@@ -1028,24 +1063,32 @@ class AME2DirectWrapper:
     # ── rsl_rl VecEnv required methods ─────────────────────────────────────
 
     def get_observations(self):
-        """Return current obs as TensorDict (rsl_rl interface)."""
+        """Return (obs_flat, extras) — rsl_rl VecEnv interface.
+
+        obs_flat: (N, 3140) tensor containing all obs packed flat.
+        extras["observations"]: empty dict (no separate critic obs group).
+        """
         if self._last_obs is None:
-            # First call: reset env to get initial obs
             obs_dict, _ = self._env.reset()
-            self._last_obs = self._to_td(obs_dict)
-        return self._last_obs
+            self._last_obs = pack_obs(obs_dict, self.num_envs)
+        extras = self.extras
+        if "observations" not in extras:
+            extras["observations"] = {}
+        return self._last_obs, extras
 
     def step(self, actions: torch.Tensor):
-        """4-tuple: (obs_td, rewards, dones, extras) — rsl_rl VecEnv interface."""
+        """4-tuple: (obs_flat, rewards, dones, infos) — rsl_rl VecEnv interface."""
         obs_dict, reward, terminated, truncated, info = self._env.step(actions)
         dones            = terminated | truncated
-        self._last_obs   = self._to_td(obs_dict)
+        self._last_obs   = pack_obs(obs_dict, self.num_envs)
+        if "observations" not in info:
+            info["observations"] = {}
         return self._last_obs, reward, dones, info
 
     def reset(self):
         """Gymnasium-style reset; also updates cached obs."""
         obs_dict, info   = self._env.reset()
-        self._last_obs   = self._to_td(obs_dict)
+        self._last_obs   = pack_obs(obs_dict, self.num_envs)
         return self._last_obs, info
 
     def close(self):
@@ -1068,11 +1111,5 @@ class AME2DirectWrapper:
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _to_td(self, obs_dict: dict):
-        """Wrap obs dict in TensorDict (or plain dict if tensordict not installed)."""
-        keys = ("prop", "map", "map_teacher", "critic_prop", "contact")
-        sub  = {k: obs_dict[k] for k in keys}
-        try:
-            from tensordict import TensorDict
-            return TensorDict(sub, batch_size=[self.num_envs], device=self._device)
-        except ImportError:
-            return sub
+        """Pack obs dict into flat tensor for rsl_rl storage."""
+        return pack_obs(obs_dict, self.num_envs)

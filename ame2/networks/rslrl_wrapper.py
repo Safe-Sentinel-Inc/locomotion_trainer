@@ -345,19 +345,27 @@ class AME2ActorCritic(nn.Module):
         else:
             return torch.exp(self.log_std)
 
+    def _unpack_obs(self, obs):
+        """Unpack obs: if flat tensor (N, D), convert to dict; if already dict, use as-is."""
+        if isinstance(obs, torch.Tensor) and obs.dim() == 2:
+            from ame2_direct.env import unpack_obs
+            return unpack_obs(obs)
+        return obs  # already a dict/TensorDict
+
     def _forward_actor(self, obs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run actor policy on obs TensorDict.
+        """Run actor policy on obs (flat tensor or dict).
 
         Returns: (action_mean, map_emb, prop_emb)
         """
+        d = self._unpack_obs(obs)
         if self.is_student:
             return self.actor(
-                obs["map"],
-                prop_hist=obs["history"],
-                commands=obs["commands"],
+                d["map"],
+                prop_hist=d["history"],
+                commands=d["commands"],
             )
         else:
-            return self.actor(obs["map"], prop=obs["prop"])
+            return self.actor(d["map"], prop=d["prop"])
 
     def _update_distribution(self, obs) -> None:
         """Compute action mean from actor network, build Normal distribution."""
@@ -412,9 +420,10 @@ class AME2ActorCritic(nn.Module):
         Returns:
             value: (B, 1)  — mean of original and mirrored value estimates.
         """
-        map_t   = obs["map_teacher"]
-        prop    = obs["critic_prop"]   # (B, 50) — full critic command
-        contact = obs["contact"]
+        d       = self._unpack_obs(obs)
+        map_t   = d["map_teacher"]
+        prop    = d["critic_prop"]   # (B, 55) — full critic command
+        contact = d["contact"]
 
         v_orig = self.critic(map_t, prop, contact)
 

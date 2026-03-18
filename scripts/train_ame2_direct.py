@@ -114,10 +114,6 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
             desired_kl=0.01,
             max_grad_norm=1.0,
         ),
-        obs_groups={
-            "policy": ["prop"],
-            "critic": ["prop"],
-        },
     )
     return cfg.to_dict()
 

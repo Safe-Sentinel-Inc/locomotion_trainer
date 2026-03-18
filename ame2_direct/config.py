@@ -200,7 +200,7 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     height_scanner: RayCasterCfg = RayCasterCfg(
         prim_path="/World/envs/env_.*/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(1.0, 0.0, 20.0)),  # V46: paper Sec.V-B "centered at x=1.0m"
-        ray_alignment="yaw",
+        attach_yaw_only=True,
         pattern_cfg=patterns.GridPatternCfg(
             resolution=0.04,
             size=[1.20, 2.00],  # (31-1)*0.04 × (51-1)*0.04
@@ -213,7 +213,7 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     height_scanner_policy: RayCasterCfg = RayCasterCfg(
         prim_path="/World/envs/env_.*/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.6, 0.0, 20.0)),  # V46: paper Sec.IV-E "centered at x=0.6m"
-        ray_alignment="yaw",
+        attach_yaw_only=True,
         pattern_cfg=patterns.GridPatternCfg(
             resolution=0.08,
             size=[1.04, 2.80],  # (14-1)*0.08 × (36-1)*0.08
