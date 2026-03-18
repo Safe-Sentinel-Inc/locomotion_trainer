@@ -323,11 +323,8 @@ class AME2DirectEnv(DirectRLEnv):
         goal_xy_b = self._get_goal_xy_body()
         d_xy      = torch.norm(goal_xy_b, dim=1)
 
-        # 1. position_tracking — Paper Eq.(1): 1/(1+0.25*d²)
-        #    V49: _t_mask removed (was T=4s → only last 200/1000 steps active).
-        #    80% of episode had ZERO position reward → robot learned "stand still".
-        #    Now always-on; approach reward provides walking incentive.
-        r_pos = (1.0 / (1.0 + 0.25 * d_xy**2))
+        # 1. position_tracking — Paper Eq.(1): 1/(1+0.25*d²) * t_mask(4)
+        r_pos = (1.0 / (1.0 + 0.25 * d_xy**2)) * self._t_mask(4.0)
         rew += cfg.w_position_tracking * r_pos
         self._ep_sums["position_tracking"] += cfg.w_position_tracking * r_pos
 
@@ -394,22 +391,27 @@ class AME2DirectEnv(DirectRLEnv):
 
         # 2. heading_tracking Eq.(3)
         d_yaw = self._get_d_yaw()
-        r_head = (1.0/(1.0+d_yaw**2)) * self._t_mask(2.0) * (d_xy<0.5).float()
+        r_head = (1.0/(1.0+d_yaw**2)) * self._t_mask(2.0) * torch.sigmoid((0.5 - d_xy) * 10.0)
         rew += cfg.w_heading_tracking * r_head
         self._ep_sums["heading_tracking"] += cfg.w_heading_tracking * r_head
 
-        # 3. moving_to_goal Eq.(4): max(v·cos(θ) - v_min, 0) * I(d > 0.5)
-        #    Continuous reward proportional to projected speed toward goal.
+        # 3. moving_to_goal — Paper Eq.(4): binary reward
+        #    r_move = 1 if (d_xy < 0.5) OR (cos(θ) > 0.5 AND v_min ≤ ||v|| ≤ v_max)
         vel_xy  = self._robot.data.root_lin_vel_b[:, :2]
         to_goal = goal_xy_b / (d_xy.unsqueeze(1) + 1e-8)   # unit direction to goal
         v_proj  = (vel_xy * to_goal).sum(1)                  # ||v||·cos(θ) in m/s
+        speed   = torch.norm(vel_xy, dim=-1)
         v_min   = cfg.moving_to_goal_v_min                   # Paper: 0.3 m/s
-        r_move  = torch.relu(v_proj - v_min) * (d_xy > 0.5).float()
+        v_max   = 2.0                                        # Paper: 2.0 m/s
+        cos_ok  = v_proj / (speed + 1e-8) > 0.5             # cos(θ) > 0.5
+        speed_ok = (speed >= v_min) & (speed <= v_max)
+        near_goal = d_xy < 0.5
+        r_move  = (near_goal | (cos_ok & speed_ok)).float()
         rew += cfg.w_moving_to_goal * r_move
         self._ep_sums["moving_to_goal"] += cfg.w_moving_to_goal * r_move
 
         # 4. vel_toward_goal (disabled, w=0)
-        r_vel  = torch.clamp(v_proj/2.0, -1.0, 1.0) * (d_xy>=0.5).float()
+        r_vel  = torch.clamp(v_proj/2.0, -1.0, 1.0) * torch.sigmoid((d_xy - 0.5) * 10.0)
         rew += cfg.w_vel_toward_goal * r_vel
         self._ep_sums["vel_toward_goal"] += cfg.w_vel_toward_goal * r_vel
 
@@ -451,8 +453,8 @@ class AME2DirectEnv(DirectRLEnv):
         rew += cfg.w_undesired_contacts * r_undes
         self._ep_sums["undesired_contacts"] += cfg.w_undesired_contacts * r_undes
 
-        # ang_vel_xy_l2 — penalize body roll + pitch angular velocity (V46: was roll-only)
-        r_ang_vel_xy = self._robot.data.root_ang_vel_b[:, :2].square().sum(1)
+        # ang_vel_xy_l2 — Paper Table I: base roll rate [ωb]_x² only
+        r_ang_vel_xy = self._robot.data.root_ang_vel_b[:, 0].square()
         rew += cfg.w_ang_vel_xy_l2 * r_ang_vel_xy
         self._ep_sums["ang_vel_xy_l2"] += cfg.w_ang_vel_xy_l2 * r_ang_vel_xy
 
@@ -883,10 +885,21 @@ class AME2DirectEnv(DirectRLEnv):
         return rel.permute(0, 2, 1).reshape(self.num_envs, 3, 14, 36)  # (N, 3, 14, 36)
 
     def _standing_at_goal_reward(self, d_xy, d_yaw) -> torch.Tensor:
-        """Paper Eq.(5): exp(-4·||v||²) · I(d<0.5) · I(d_yaw<0.5) · I(t_left<2s)."""
-        vel_sq = self._robot.data.root_lin_vel_b.square().sum(1)  # ||v||² (3D)
-        gate   = ((d_xy < 0.5) & (d_yaw < 0.5)).float() * self._t_mask(2.0)
-        return torch.exp(-4.0 * vel_sq) * gate
+        """Paper Eq.(5): I(d<0.5 AND d_yaw<0.5) * exp(-(d_foot+d_g+d_q+d_xy)/4)."""
+        # d_foot: fraction of feet not in contact
+        foot_forces = torch.norm(
+            self._contact_sensor.data.net_forces_w[:, self._foot_cs_ids, :], dim=-1
+        )
+        feet_in_contact = (foot_forces > 1.0).float()
+        d_foot = 1.0 - feet_in_contact.mean(dim=1)  # 0=all contact, 1=none
+        # d_g: base tilt relative to gravity
+        g_b = self._robot.data.projected_gravity_b
+        d_g = 1.0 - g_b[:, 2].square()  # 1 - [gb]_z²
+        # d_q: mean joint deviation from default
+        d_q = (self._robot.data.joint_pos - self._robot.data.default_joint_pos).abs().mean(dim=1)
+        # gate with soft sigmoid
+        gate = torch.sigmoid((0.5 - d_xy) * 10.0) * torch.sigmoid((0.5 - d_yaw) * 10.0) * self._t_mask(2.0)
+        return torch.exp(-(d_foot + d_g + d_q + d_xy) / 4.0) * gate
 
     def _undesired_events(self) -> torch.Tensor:
         pen   = torch.zeros(self.num_envs, device=self.device)

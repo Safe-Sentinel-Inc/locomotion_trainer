@@ -1,16 +1,12 @@
-"""AME-2 Teacher Training — V43 Paper-Faithful.
+"""AME-2 Teacher Training — True Distributed.
 
-Matches AME-2 paper exactly (Table I + Table VI + Sec.IV-D).
-No simplifications, no bootstrap, no custom curriculum.
-
-Only paper curricula kept:
-  - Heading: face-goal → random yaw over first 20% iters (Sec.IV-D.3)
-  - Perception noise: 0 → max over first 20% iters (Sec.IV-D.3)
-  - Terrain: automatic via IsaacLab (success → harder, fail → easier)
+Uses RSL-RL's built-in distributed training (gradient sync via all_reduce)
+instead of manual parameter averaging.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python scripts/train_ame2_direct.py \
-        --num_envs 2048 --seed 42 --log_dir logs_v43/gpu0 --headless
+    LD_PRELOAD=/lib/x86_64-linux-gnu/libnccl.so.2 torchrun --nproc_per_node=8 \
+        scripts/train_ame2_direct.py --num_envs 1200 --seed 42 \
+        --log_dir logs/distributed --headless
 """
 
 from __future__ import annotations
@@ -25,10 +21,10 @@ import isaacsim  # noqa: F401
 from isaaclab.app import AppLauncher
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="AME-2 V43 Teacher Training (Paper-Faithful)")
+parser = argparse.ArgumentParser(description="AME-2 Teacher Training (True Distributed)")
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument("--num_envs",         type=int,   default=2048,
-                    help="Number of parallel environments (paper: 4800)")
+                    help="Number of parallel environments per GPU")
 parser.add_argument("--max_iterations",   type=int,   default=80_000,
                     help="Total PPO training iterations")
 parser.add_argument("--seed",             type=int,   default=42)
@@ -61,8 +57,6 @@ _rank = int(os.environ.get("RANK", "0"))
 _is_distributed = _world_size > 1
 if _is_distributed:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
-    # We handle distributed gradient sync manually (not via rsl_rl runner)
-    # so DON'T set args_cli.distributed — runner stays in single-GPU mode
 
 print(f"[Rank {_rank}] Creating AppLauncher (CVD={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')})...", flush=True)
 app_launcher = AppLauncher(args_cli)
@@ -71,8 +65,10 @@ print(f"[Rank {_rank}] AppLauncher ready", flush=True)
 
 # ── Post-launch imports ───────────────────────────────────────────────────────
 import os
+import re
 import time
 import torch
+import torch.distributed as dist
 
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
@@ -104,7 +100,7 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
         device=device,
         num_steps_per_env=24,            # Paper Table VI
         max_iterations=args_cli.max_iterations,
-        save_interval=999999,
+        save_interval=50,
         experiment_name="ame2_v46",
         empirical_normalization=False,
         policy=RslRlPpoActorCriticCfg(
@@ -114,12 +110,12 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
             activation="elu",
         ),
         algorithm=RslRlPpoAlgorithmCfg(
-            value_loss_coef=1.0,
+            value_loss_coef=2.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
             entropy_coef=0.004,          # Paper Table VI: 0.004→0.001 (decay handled by update_curricula)
-            num_learning_epochs=4,       # Paper Table VI (was 2)
-            num_mini_batches=8,          # V51: 16→8, batch 6144 (2x gradient quality; 4 OOMs)
+            num_learning_epochs=4,       # Paper Table VI
+            num_mini_batches=8,          # 8 mini-batches (stable training)
             learning_rate=1e-3,
             schedule="adaptive",
             gamma=0.99,                  # Paper Table VI
@@ -132,13 +128,8 @@ def make_runner_cfg(seed: int, log_dir: str, device: str) -> dict:
 
 
 # ── Paper Curricula (Sec.IV-D.3) ────────────────────────────────────────────
-# Only two curricula from paper: heading and perception noise, both 20% ramp.
-# Terrain curriculum is automatic in IsaacLab (no custom code needed).
-
-_HEADING_RAMP_FRAC = 0.2        # Paper: "first 20% iterations"
-_NOISE_RAMP_FRAC   = 0.2        # Paper: "first 20% iterations"
-
-# Entropy decay: 0.004 → 0.001 over training (Paper Table VI)
+_HEADING_RAMP_FRAC = 0.2
+_NOISE_RAMP_FRAC   = 0.2
 _ENTROPY_START = 0.004
 _ENTROPY_END   = 0.001
 
@@ -147,15 +138,12 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
     """Paper curricula only — heading, noise, entropy decay."""
     max_it = args_cli.max_iterations
 
-    # ── 1. Heading: face-goal → random yaw over first 20% ──
     heading_frac = min(1.0, it / max(1, int(_HEADING_RAMP_FRAC * max_it)))
     env_direct.set_heading_curriculum(heading_frac)
 
-    # ── 2. Perception noise: 0 → max over first 20% ──
     noise_scale = min(1.0, it / max(1, int(_NOISE_RAMP_FRAC * max_it)))
     env_direct.set_scan_noise_scale(noise_scale)
 
-    # ── 3. Entropy decay: 0.004 → 0.001 linearly (Paper Table VI) ──
     frac = min(1.0, it / max(1, max_it))
     entropy = _ENTROPY_START + (_ENTROPY_END - _ENTROPY_START) * frac
     runner.alg.entropy_coef = entropy
@@ -164,28 +152,20 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Distributed setup ──
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_distributed = world_size > 1
-    device = "cuda:0"  # Each rank sees only 1 GPU via CUDA_VISIBLE_DEVICES
+    device = "cuda:0"  # Each rank sees only 1 GPU via CVD masking
+    is_main = rank == 0
 
     torch.manual_seed(args_cli.seed + rank)
-
-    if is_distributed:
-        import torch.distributed as dist
-        print(f"[Rank {rank}] Initializing distributed (world_size={world_size})...", flush=True)
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        print(f"[Rank {rank}] Distributed initialized", flush=True)
-
-    is_main = rank == 0
 
     # ── Env ──
     policy_cfg = anymal_d_policy_cfg()
     policy_cfg.d_prop_critic = 55
     env_cfg = AME2DirectEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-    # ── Apply CLI reward overrides (before env __init__ scales by dt) ──
     for attr_name in dir(env_cfg):
         if attr_name.startswith('w_') and isinstance(getattr(env_cfg, attr_name), (int, float)):
             val = getattr(args_cli, attr_name, None)
@@ -208,16 +188,31 @@ def main():
         is_student=False,
     ).to(device)
 
-    # ── Runner (single-GPU mode — we handle gradient sync ourselves) ──
-    # Temporarily hide WORLD_SIZE so runner doesn't try its own multi-GPU init
-    _saved_ws = os.environ.pop("WORLD_SIZE", None)
+    # ── Runner with RSL-RL native distributed ──
+    # We already called init_process_group, so we need to prevent the runner
+    # from calling it again. We do this by temporarily patching LOCAL_RANK
+    # to 0 (matching our CVD-masked cuda:0 device).
+    _saved_local_rank = os.environ.get("LOCAL_RANK")
+    if is_distributed:
+        os.environ["LOCAL_RANK"] = "0"  # match cuda:0 after CVD masking
+
     os.makedirs(args_cli.log_dir, exist_ok=True)
     runner_cfg = make_runner_cfg(args_cli.seed, args_cli.log_dir, device)
     runner = OnPolicyRunner(rsl_env, runner_cfg, args_cli.log_dir, device=device)
-    if _saved_ws is not None:
-        os.environ["WORLD_SIZE"] = _saved_ws
+
+    # Restore LOCAL_RANK
+    if _saved_local_rank is not None:
+        os.environ["LOCAL_RANK"] = _saved_local_rank
+
+    # Replace runner's policy and optimizer with our AME-2 network
     runner.alg.policy = ame2_net
     runner.alg.optimizer = torch.optim.Adam(ame2_net.parameters(), lr=1e-3)
+
+    # Verify the runner detected distributed mode
+    if is_main:
+        print(f"  Runner distributed: {runner.is_distributed}, "
+              f"world_size: {runner.gpu_world_size}, "
+              f"multi_gpu_cfg: {runner.multi_gpu_cfg is not None}")
 
     # ── Resume ──
     it_start = 0
@@ -229,77 +224,66 @@ def main():
         ame2_net.load_state_dict(state, strict=False)
         with torch.no_grad():
             ame2_net.std.fill_(0.5)
-        import re
         m = re.search(r"model_(\d+)\.pt", args_cli.resume)
         if m:
             it_start = int(m.group(1)) + 1
             if is_main:
                 print(f"[Resume] from iteration {it_start}")
 
-    # ── Broadcast initial parameters from rank 0 to all ranks ──
-    if is_distributed:
-        print(f"[Rank {rank}] Broadcasting parameters...", flush=True)
-        model_params = [ame2_net.state_dict()]
-        dist.broadcast_object_list(model_params, src=0)
-        if rank != 0:
-            ame2_net.load_state_dict(model_params[0])
-        print(f"[Rank {rank}] Parameters synced", flush=True)
-
     # ── Print config (rank 0 only) ──
     if is_main:
         total_envs = args_cli.num_envs * world_size
-        print(f"\n[AME-2 V43 Paper-Faithful — Distributed]")
+        print(f"\n[AME-2 Teacher — True Distributed]")
         print(f"  GPUs={world_size}  envs/GPU={args_cli.num_envs}  total_envs={total_envs}  "
               f"iters={args_cli.max_iterations}  seed={args_cli.seed}")
         print(f"  episode={env_cfg.episode_length_s}s  "
               f"goal=[{env_cfg.goal_pos_range_min}, {env_cfg.goal_pos_range_max}]m  "
               f"v_min={env_cfg.moving_to_goal_v_min}")
         print(f"  PPO: epochs=4  mini_batches=8  entropy=0.004→0.001")
+        print(f"  Distributed: gradient sync via all_reduce (RSL-RL native)")
         print(f"  Rewards (pre-dt): pos={env_cfg.w_position_tracking:.0f} arrival={env_cfg.w_arrival:.0f} "
               f"vel={env_cfg.w_vel_toward_goal:.0f} move={env_cfg.w_moving_to_goal:.0f} "
               f"appr={env_cfg.w_position_approach:.0f} undes={env_cfg.w_undesired_contacts:.0f}")
         print(f"  Log: {args_cli.log_dir}\n")
 
+    # ── W&B logging (rank 0 only) ──
+    if is_main:
+        import wandb
+        wandb.init(
+            project="ame2-locomotion",
+            name="anymal-d-teacher-8xH100-truedist",
+            config={
+                "robot": "ANYmal-D",
+                "phase": "teacher",
+                "gpus": world_size,
+                "gpu_type": "H100-80GB",
+                "envs_per_gpu": args_cli.num_envs,
+                "total_envs": args_cli.num_envs * world_size,
+                "mini_batches": 8,
+                "learning_epochs": 4,
+                "steps_per_env": 24,
+                "max_iterations": args_cli.max_iterations,
+                "seed": args_cli.seed,
+                "distributed": "true_gradient_sync",
+            },
+            resume="allow",
+        )
+
+    # ── Training loop ──
+    # Use the runner's native learn() which handles:
+    # - rollout collection
+    # - advantage computation
+    # - PPO update with gradient all_reduce across GPUs
+    # - logging and checkpointing (rank 0 only)
+    runner.current_learning_iteration = it_start
     t0 = time.time()
 
     for it in range(it_start, args_cli.max_iterations):
-        # ── Each rank collects rollout + does local PPO update ──
         runner.learn(num_learning_iterations=1, init_at_random_ep_len=False)
-
-        # ── Distributed gradient sync: average parameters across all ranks ──
-        if is_distributed:
-            with torch.no_grad():
-                for param in ame2_net.parameters():
-                    dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
-                    param.data /= world_size
-
-            # ── Verify sync every 200 iters: all ranks should have identical params ──
-            if it % 200 == 0:
-                with torch.no_grad():
-                    local_sum = sum(p.data.sum().item() for p in ame2_net.parameters())
-                    checksum = torch.tensor([local_sum], device=device)
-                    # Gather checksums from all ranks to rank 0
-                    if is_main:
-                        gathered = [torch.zeros(1, device=device) for _ in range(world_size)]
-                        dist.gather(checksum, gathered, dst=0)
-                        sums = [g.item() for g in gathered]
-                        max_diff = max(sums) - min(sums)
-                        status = "SYNCED" if max_diff < 1e-3 else f"DIVERGED (diff={max_diff:.6f})"
-                        print(f"[Sync Check it {it}] param_sums={[f'{s:.4f}' for s in sums]} → {status}", flush=True)
-                    else:
-                        dist.gather(checksum, dst=0)
 
         update_curricula(rsl_env, runner, it)
 
-        # Save checkpoint every 50 iters (rank 0 only)
-        if it % 50 == 0 and is_main:
-            ckpt_path = os.path.join(args_cli.log_dir, f"model_{it}.pt")
-            torch.save({
-                "model_state_dict": ame2_net.state_dict(),
-                "iteration": it,
-            }, ckpt_path)
-
-        # Logging every 50 iters (rank 0 only)
+        # Custom logging every 50 iters (rank 0 only)
         if it % 50 == 0 and is_main:
             elapsed = time.time() - t0
             it_time = elapsed / max(it - it_start + 1, 1)
@@ -324,11 +308,26 @@ def main():
                 f"appr={appr:.3f}  vtg={vtg:.3f}  "
                 f"iter={it_time:.1f}s  ETA={eta_h:.1f}h"
             )
+            wandb.log({
+                "terrain_level": rsl_env.get_terrain_level(),
+                "terminal_dxy": dxy,
+                "success_0.5m": succ05,
+                "success_1.0m": succ100,
+                "position_tracking": pos_t,
+                "moving_to_goal": move,
+                "standing_at_goal": stand,
+                "heading_tracking": head,
+                "position_approach": appr,
+                "vel_toward_goal": vtg,
+                "iter_time_s": it_time,
+                "eta_hours": eta_h,
+            }, step=it)
 
-    if is_distributed:
+    if is_distributed and dist.is_initialized():
         dist.destroy_process_group()
     if is_main:
-        print("[AME-2 V43] Done!")
+        wandb.finish()
+        print("[AME-2] Done!")
     simulation_app.close()
 
 

@@ -269,6 +269,6 @@ class AME2DirectEnvCfg(DirectRLEnvCfg):
     w_link_acceleration:    float = -0.001   # Paper: Link Acceleration -0.001
     #
     # === Simulation Fidelity (Paper Table I) ===
-    w_joint_pos_limits:     float = -50.0    # v46 fix: -1000 causes noise collapse (robot prefers standing still)
+    w_joint_pos_limits:     float = -1000.0  # Paper Table I: -1000
     w_joint_vel_limits:     float = -1.0     # Paper: -1
     w_joint_torque_limits:  float = -1.0     # Paper: -1
