@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 # ── Isaac Sim MUST be imported before anything else ──────────────────────────
@@ -53,8 +54,20 @@ args_cli, _ = parser.parse_known_args()
 if not hasattr(args_cli, "headless"):
     args_cli.headless = True
 
+# ── Multi-GPU: each rank sees only its own GPU via CUDA_VISIBLE_DEVICES ──
+_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+_rank = int(os.environ.get("RANK", "0"))
+_is_distributed = _world_size > 1
+if _is_distributed:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
+    # We handle distributed gradient sync manually (not via rsl_rl runner)
+    # so DON'T set args_cli.distributed — runner stays in single-GPU mode
+
+print(f"[Rank {_rank}] Creating AppLauncher (CVD={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')})...", flush=True)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+print(f"[Rank {_rank}] AppLauncher ready", flush=True)
 
 # ── Post-launch imports ───────────────────────────────────────────────────────
 import os
@@ -151,8 +164,21 @@ def update_curricula(env_direct: AME2DirectWrapper, runner: OnPolicyRunner, it: 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    torch.manual_seed(args_cli.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # ── Distributed setup ──
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    is_distributed = world_size > 1
+    device = "cuda:0"  # Each rank sees only 1 GPU via CUDA_VISIBLE_DEVICES
+
+    torch.manual_seed(args_cli.seed + rank)
+
+    if is_distributed:
+        import torch.distributed as dist
+        print(f"[Rank {rank}] Initializing distributed (world_size={world_size})...", flush=True)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        print(f"[Rank {rank}] Distributed initialized", flush=True)
+
+    is_main = rank == 0
 
     # ── Env ──
     policy_cfg = anymal_d_policy_cfg()
@@ -165,8 +191,11 @@ def main():
             val = getattr(args_cli, attr_name, None)
             if val is not None:
                 setattr(env_cfg, attr_name, val)
-                print(f"  [Override] {attr_name} = {val}")
+                if is_main:
+                    print(f"  [Override] {attr_name} = {val}")
+    print(f"[Rank {rank}] Creating env ({args_cli.num_envs} envs)...", flush=True)
     env = AME2DirectEnv(cfg=env_cfg)
+    print(f"[Rank {rank}] Env created", flush=True)
 
     rsl_env = AME2DirectWrapper(env, device=device)
 
@@ -179,18 +208,23 @@ def main():
         is_student=False,
     ).to(device)
 
-    # ── Runner ──
+    # ── Runner (single-GPU mode — we handle gradient sync ourselves) ──
+    # Temporarily hide WORLD_SIZE so runner doesn't try its own multi-GPU init
+    _saved_ws = os.environ.pop("WORLD_SIZE", None)
     os.makedirs(args_cli.log_dir, exist_ok=True)
     runner_cfg = make_runner_cfg(args_cli.seed, args_cli.log_dir, device)
     runner = OnPolicyRunner(rsl_env, runner_cfg, args_cli.log_dir, device=device)
+    if _saved_ws is not None:
+        os.environ["WORLD_SIZE"] = _saved_ws
     runner.alg.policy = ame2_net
     runner.alg.optimizer = torch.optim.Adam(ame2_net.parameters(), lr=1e-3)
 
     # ── Resume ──
     it_start = 0
     if args_cli.resume:
-        print(f"[Resume] {args_cli.resume}")
-        ckpt = torch.load(args_cli.resume, map_location=device)
+        if is_main:
+            print(f"[Resume] {args_cli.resume}")
+        ckpt = torch.load(args_cli.resume, map_location=device, weights_only=False)
         state = ckpt.get("model_state_dict", ckpt)
         ame2_net.load_state_dict(state, strict=False)
         with torch.no_grad():
@@ -199,37 +233,74 @@ def main():
         m = re.search(r"model_(\d+)\.pt", args_cli.resume)
         if m:
             it_start = int(m.group(1)) + 1
-            print(f"[Resume] from iteration {it_start}")
+            if is_main:
+                print(f"[Resume] from iteration {it_start}")
 
-    # ── Print config ──
-    print(f"\n[AME-2 V43 Paper-Faithful]")
-    print(f"  envs={args_cli.num_envs}  iters={args_cli.max_iterations}  "
-          f"seed={args_cli.seed}  device={device}")
-    print(f"  episode={env_cfg.episode_length_s}s  "
-          f"goal=[{env_cfg.goal_pos_range_min}, {env_cfg.goal_pos_range_max}]m  "
-          f"v_min={env_cfg.moving_to_goal_v_min}")
-    print(f"  PPO: epochs=4  mini_batches=8  entropy=0.004→0.001")
-    print(f"  Rewards (pre-dt): pos={env_cfg.w_position_tracking:.0f} arrival={env_cfg.w_arrival:.0f} "
-          f"vel={env_cfg.w_vel_toward_goal:.0f} move={env_cfg.w_moving_to_goal:.0f} "
-          f"appr={env_cfg.w_position_approach:.0f} undes={env_cfg.w_undesired_contacts:.0f}")
-    print(f"  Log: {args_cli.log_dir}\n")
+    # ── Broadcast initial parameters from rank 0 to all ranks ──
+    if is_distributed:
+        print(f"[Rank {rank}] Broadcasting parameters...", flush=True)
+        model_params = [ame2_net.state_dict()]
+        dist.broadcast_object_list(model_params, src=0)
+        if rank != 0:
+            ame2_net.load_state_dict(model_params[0])
+        print(f"[Rank {rank}] Parameters synced", flush=True)
+
+    # ── Print config (rank 0 only) ──
+    if is_main:
+        total_envs = args_cli.num_envs * world_size
+        print(f"\n[AME-2 V43 Paper-Faithful — Distributed]")
+        print(f"  GPUs={world_size}  envs/GPU={args_cli.num_envs}  total_envs={total_envs}  "
+              f"iters={args_cli.max_iterations}  seed={args_cli.seed}")
+        print(f"  episode={env_cfg.episode_length_s}s  "
+              f"goal=[{env_cfg.goal_pos_range_min}, {env_cfg.goal_pos_range_max}]m  "
+              f"v_min={env_cfg.moving_to_goal_v_min}")
+        print(f"  PPO: epochs=4  mini_batches=8  entropy=0.004→0.001")
+        print(f"  Rewards (pre-dt): pos={env_cfg.w_position_tracking:.0f} arrival={env_cfg.w_arrival:.0f} "
+              f"vel={env_cfg.w_vel_toward_goal:.0f} move={env_cfg.w_moving_to_goal:.0f} "
+              f"appr={env_cfg.w_position_approach:.0f} undes={env_cfg.w_undesired_contacts:.0f}")
+        print(f"  Log: {args_cli.log_dir}\n")
 
     t0 = time.time()
 
     for it in range(it_start, args_cli.max_iterations):
+        # ── Each rank collects rollout + does local PPO update ──
         runner.learn(num_learning_iterations=1, init_at_random_ep_len=False)
+
+        # ── Distributed gradient sync: average parameters across all ranks ──
+        if is_distributed:
+            with torch.no_grad():
+                for param in ame2_net.parameters():
+                    dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+                    param.data /= world_size
+
+            # ── Verify sync every 200 iters: all ranks should have identical params ──
+            if it % 200 == 0:
+                with torch.no_grad():
+                    local_sum = sum(p.data.sum().item() for p in ame2_net.parameters())
+                    checksum = torch.tensor([local_sum], device=device)
+                    # Gather checksums from all ranks to rank 0
+                    if is_main:
+                        gathered = [torch.zeros(1, device=device) for _ in range(world_size)]
+                        dist.gather(checksum, gathered, dst=0)
+                        sums = [g.item() for g in gathered]
+                        max_diff = max(sums) - min(sums)
+                        status = "SYNCED" if max_diff < 1e-3 else f"DIVERGED (diff={max_diff:.6f})"
+                        print(f"[Sync Check it {it}] param_sums={[f'{s:.4f}' for s in sums]} → {status}", flush=True)
+                    else:
+                        dist.gather(checksum, dst=0)
+
         update_curricula(rsl_env, runner, it)
 
-        # Save checkpoint every 50 iters
-        if it % 50 == 0:
+        # Save checkpoint every 50 iters (rank 0 only)
+        if it % 50 == 0 and is_main:
             ckpt_path = os.path.join(args_cli.log_dir, f"model_{it}.pt")
             torch.save({
                 "model_state_dict": ame2_net.state_dict(),
                 "iteration": it,
             }, ckpt_path)
 
-        # Logging every 50 iters
-        if it % 50 == 0:
+        # Logging every 50 iters (rank 0 only)
+        if it % 50 == 0 and is_main:
             elapsed = time.time() - t0
             it_time = elapsed / max(it - it_start + 1, 1)
             eta_h   = it_time * (args_cli.max_iterations - it) / 3600
@@ -254,7 +325,10 @@ def main():
                 f"iter={it_time:.1f}s  ETA={eta_h:.1f}h"
             )
 
-    print("[AME-2 V43] Done!")
+    if is_distributed:
+        dist.destroy_process_group()
+    if is_main:
+        print("[AME-2 V43] Done!")
     simulation_app.close()
 
 
