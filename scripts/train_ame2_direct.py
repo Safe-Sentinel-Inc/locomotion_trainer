@@ -283,6 +283,14 @@ def main():
 
         update_curricula(rsl_env, runner, it)
 
+        # Save checkpoint every 50 iters (rank 0 only)
+        if it % 50 == 0 and is_main:
+            ckpt_path = os.path.join(args_cli.log_dir, f"model_{it}.pt")
+            torch.save({
+                "model_state_dict": ame2_net.state_dict(),
+                "iteration": it,
+            }, ckpt_path)
+
         # Custom logging every 50 iters (rank 0 only)
         if it % 50 == 0 and is_main:
             elapsed = time.time() - t0

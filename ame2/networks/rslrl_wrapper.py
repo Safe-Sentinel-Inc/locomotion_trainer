@@ -339,11 +339,11 @@ class AME2ActorCritic(nn.Module):
     # ------------------------------------------------------------------
 
     def _get_std(self) -> torch.Tensor:
-        """Get current action std from parameters, clamped to [0.2, 0.5]."""
+        """Get current action std from parameters."""
         if self.noise_std_type == "scalar":
-            return self.std.clamp(0.2, 0.5)
+            return self.std
         else:
-            return torch.exp(self.log_std).clamp(0.2, 0.5)
+            return torch.exp(self.log_std)
 
     def _unpack_obs(self, obs):
         """Unpack obs: if flat tensor (N, D), convert to dict; if already dict, use as-is."""
