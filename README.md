@@ -14,21 +14,6 @@ Unofficial reimplementation of **AME-2** — goal-conditioned navigation for leg
 
 ---
 
-## Current Results
-
-**V43l** (2048 envs, RTX 3090, training from iteration 801):
-
-| Metric | Value | Trend |
-|--------|-------|-------|
-| moving_to_goal | 0.32 | rising |
-| episode length | ~100 steps (2s) | recovering (bottom was 40) |
-| terminal_dxy | ~3.8m | slowly decreasing |
-| success@0.5m | 0% | not yet reaching goals |
-
-Robot has learned to move toward goals and avoid knee crawling. Still falling early (~2s episodes). Training ongoing — expect improvement over next few thousand iterations as episode length grows.
-
----
-
 ## How It Works
 
 ```
