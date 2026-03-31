@@ -1,6 +1,4 @@
-# AME-2: Unofficial Reimplementation
-
-Unofficial reimplementation of **AME-2** — goal-conditioned navigation for legged robots on rough terrains.
+# AME-2
 
 > Chong Zhang, Victor Klemm, Fan Yang, Marco Hutter (ETH Zurich RSL)
 > *"AME-2: Agile and Generalized Legged Locomotion via Attention-Based Neural Map Encoding"*
