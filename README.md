@@ -1,6 +1,6 @@
 # AME-2
 
-<video src="https://github.com/Safe-Sentinel-Inc/locomotion_trainer/raw/main/assets/humanoid_generalized_locomotion.mp4" controls autoplay muted loop width="100%"></video>
+[![Humanoid Locomotion Demo](https://img.shields.io/badge/Watch-Demo_Video-blue?style=for-the-badge&logo=github)](https://github.com/Safe-Sentinel-Inc/locomotion_trainer/raw/main/assets/humanoid_generalized_locomotion.mp4)
 
 **Robots:** ANYmal-D (12-DoF quadruped) | PF_TRON1A (6-DoF biped)
 **Sim:** Isaac Lab 0.46.x (Direct Workflow) + RSL-RL (PPO)
