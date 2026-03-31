@@ -1,4 +1,4 @@
-# AME-2
+# Locomotion Trainer (Safe Sentinel)
 
 ![Humanoid Generalized Locomotion](assets/humanoid_generalized_locomotion.gif)
 
