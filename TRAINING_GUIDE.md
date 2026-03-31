@@ -13,7 +13,7 @@ Full setup and training instructions for AME-2 legged locomotion on NVIDIA GPUs.
 ## Clone & Setup on a New Machine
 
 ```bash
-git clone https://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@github.com/PRB-R-NINE-T/locomotion_trainer.git
+git clone https://github.com/Safe-Sentinel-Inc/locomotion_trainer.git
 cd locomotion_trainer
 ```
 
