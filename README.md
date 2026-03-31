@@ -2,7 +2,7 @@
 
 ![Humanoid Generalized Locomotion](assets/humanoid_generalized_locomotion.gif)
 
-*Clip from Chong Zhang et al.'s successful AME-2 deployment ([arXiv:2601.08485](https://arxiv.org/abs/2601.08485))*
+*Clip from Chong Zhang et al.'s successful AME-2 deployment*
 
 **Robots:** ANYmal-D (12-DoF quadruped) | PF_TRON1A (6-DoF biped)
 **Sim:** Isaac Lab 0.46.x (Direct Workflow) + RSL-RL (PPO)
