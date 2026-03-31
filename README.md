@@ -1,8 +1,6 @@
 # AME-2
 
-> Chong Zhang, Victor Klemm, Fan Yang, Marco Hutter (ETH Zurich RSL)
-> *"AME-2: Agile and Generalized Legged Locomotion via Attention-Based Neural Map Encoding"*
-> [arXiv:2601.08485](https://arxiv.org/abs/2601.08485)
+<video src="https://github.com/Safe-Sentinel-Inc/locomotion_trainer/raw/main/assets/humanoid_generalized_locomotion.mp4" controls autoplay muted loop width="100%"></video>
 
 **Robots:** ANYmal-D (12-DoF quadruped) | PF_TRON1A (6-DoF biped)
 **Sim:** Isaac Lab 0.46.x (Direct Workflow) + RSL-RL (PPO)
@@ -12,6 +10,10 @@
 
 ![Navigation metrics](wandb/training_nav_metrics.png)
 ![Reward components](wandb/training_reward_components.png)
+
+### Acknowledgements
+
+This work builds on the research of **Chong Zhang, Victor Klemm, Fan Yang, and Marco Hutter** at ETH Zurich RSL. Their paper [AME-2: Agile and Generalized Legged Locomotion via Attention-Based Neural Map Encoding](https://arxiv.org/abs/2601.08485) provides the foundation for the architecture, training methodology, and reward design used here. We are grateful for their contribution to the field of legged locomotion.
 
 ---
 
