@@ -1,6 +1,6 @@
 # Locomotion Trainer (Safe Sentinel)
 
-![Humanoid Generalized Locomotion](assets/humanoid_generalized_locomotion.gif)
+![Generalized Humanoid Locomotion](assets/generalized_humanoid_locomotion.gif)
 
 *Clip from Chong Zhang et al.'s successful AME-2 deployment*
 
