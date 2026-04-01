@@ -1,4 +1,4 @@
-# Locomotion Trainer (Safe Sentinel)
+# Locomotion Trainer
 
 ![Generalized Humanoid Locomotion](assets/generalized_humanoid_locomotion.gif)
 
