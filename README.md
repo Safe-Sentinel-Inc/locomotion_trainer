@@ -2,10 +2,6 @@
 
 ![RL Training Demo](assets/rl_training_demo.gif)
 
-**Robots:** ANYmal-D (12-DoF quadruped) | PF_TRON1A (6-DoF biped)
-**Sim:** Isaac Lab 0.46.x (Direct Workflow) + RSL-RL (PPO)
-**Status:** Phase 1 Teacher training in progress
-
 ### Training Progress (ANYmal-D, 30K iterations)
 
 ![Navigation metrics](wandb/training_nav_metrics.png)
