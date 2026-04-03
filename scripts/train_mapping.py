@@ -1,0 +1,330 @@
+"""
+MappingNet Training Pipeline
+=============================
+Trains the MappingNet (from ame2/networks/ame2_model.py) on procedurally
+generated synthetic terrain with simulated noisy depth scans.
+
+Components:
+    HeightFieldGenerator  - Procedural terrain generation (legacy)
+    DepthScanSimulator    - Noisy depth scan simulation (legacy)
+    MappingTrainer        - Training loop with beta-NLL + TV weighting
+
+Modes:
+    --use_warp (default): Warp-raytraced terrain meshes + paper augmentations
+    --no_warp:            Legacy procedural pipeline (no Warp dependency)
+
+Usage:
+    # Default with Warp raytracing:
+    python scripts/train_mapping.py --num_steps 50000 --batch_size 64
+
+    # Legacy mode (no Warp):
+    python scripts/train_mapping.py --no_warp --num_steps 50000 --batch_size 64
+"""
+
+import argparse
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+from ame2.networks import MappingNet, MappingConfig
+
+
+# ---------------------------------------------------------------------------
+# 1. HeightFieldGenerator
+# ---------------------------------------------------------------------------
+
+class HeightFieldGenerator:
+    """
+    Procedurally generates synthetic terrain height fields.
+
+    Three generation methods are randomly mixed per batch:
+        1. Superimposed sine waves (random frequency / amplitude)
+        2. Random box stacking (0.05 - 0.4m tall)
+        3. Gaussian noise field (smoothed)
+    """
+
+    def __init__(self, device: torch.device = torch.device("cpu")):
+        self.device = device
+
+    def _sine_terrain(self, B: int, H: int, W: int) -> torch.Tensor:
+        hf = torch.zeros(B, 1, H, W, device=self.device)
+        xs = torch.linspace(0, 1, W, device=self.device).view(1, 1, 1, W)
+        ys = torch.linspace(0, 1, H, device=self.device).view(1, 1, H, 1)
+        for _ in range(5):
+            freq_x = torch.rand(B, 1, 1, 1, device=self.device) * 8.0 + 1.0
+            freq_y = torch.rand(B, 1, 1, 1, device=self.device) * 8.0 + 1.0
+            amp = torch.rand(B, 1, 1, 1, device=self.device) * 0.15 + 0.02
+            phase_x = torch.rand(B, 1, 1, 1, device=self.device) * 2 * np.pi
+            phase_y = torch.rand(B, 1, 1, 1, device=self.device) * 2 * np.pi
+            hf += amp * torch.sin(freq_x * xs * 2 * np.pi + phase_x) \
+                      * torch.cos(freq_y * ys * 2 * np.pi + phase_y)
+        return hf
+
+    def _box_terrain(self, B: int, H: int, W: int) -> torch.Tensor:
+        hf = torch.zeros(B, 1, H, W, device=self.device)
+        for _ in range(8):
+            for b in range(B):
+                bh = np.random.randint(3, max(4, H // 3))
+                bw = np.random.randint(3, max(4, W // 3))
+                y0 = np.random.randint(0, H - bh + 1)
+                x0 = np.random.randint(0, W - bw + 1)
+                height = np.random.uniform(0.05, 0.4)
+                hf[b, 0, y0:y0 + bh, x0:x0 + bw] += height
+        return hf
+
+    def _gaussian_terrain(self, B: int, H: int, W: int) -> torch.Tensor:
+        noise = torch.randn(B, 1, H, W, device=self.device) * 0.3
+        k, pad = 5, 2
+        kernel = torch.ones(1, 1, k, k, device=self.device) / (k * k)
+        smoothed = nn.functional.conv2d(noise, kernel, padding=pad)
+        return nn.functional.conv2d(smoothed, kernel, padding=pad)
+
+    def generate(self, B: int, H: int = 31, W: int = 51) -> torch.Tensor:
+        n1, n2, n3 = B // 3, B // 3, B - 2 * (B // 3)
+        parts = []
+        if n1 > 0:
+            parts.append(self._sine_terrain(n1, H, W))
+        if n2 > 0:
+            parts.append(self._box_terrain(n2, H, W))
+        if n3 > 0:
+            parts.append(self._gaussian_terrain(n3, H, W))
+        hf = torch.cat(parts, dim=0)
+        perm = torch.randperm(B, device=self.device)
+        return hf[perm]
+
+
+# ---------------------------------------------------------------------------
+# 2. DepthScanSimulator
+# ---------------------------------------------------------------------------
+
+class DepthScanSimulator:
+    """
+    Simulates noisy depth scans from ground-truth height fields.
+
+    Noise model (Paper Appendix B / Sec. V-B):
+        - Additive uniform noise with random magnitude on each cell  [stated]
+        - Range truncation: cells with abs(elevation) > 2.0m are set to 0
+        - Random dropout:   20% of cells set to 0
+        - Random outliers:  5% of cells assigned random values  [stated]
+    """
+
+    def __init__(self, range_max: float = 2.0, noise_max: float = 0.05,
+                 dropout_rate: float = 0.20, outlier_rate: float = 0.05,
+                 device: torch.device = torch.device("cpu")):
+        self.range_max = range_max
+        self.noise_max = noise_max
+        self.dropout_rate = dropout_rate
+        self.outlier_rate = outlier_rate
+        self.device = device
+
+    def simulate(self, gt: torch.Tensor) -> torch.Tensor:
+        scan = gt.clone()
+        # FIX: Paper says "additive uniform noise" — was Gaussian, now uniform [-noise_max, +noise_max]
+        scan = scan + (torch.rand_like(scan) * 2.0 - 1.0) * self.noise_max
+        # Range truncation and dropout — use torch.where to avoid boolean-index GPU sync
+        scan = torch.where(scan.abs() > self.range_max, torch.zeros_like(scan), scan)
+        scan = torch.where(torch.rand_like(scan) < self.dropout_rate, torch.zeros_like(scan), scan)
+        # Random outliers: assign random elevation values (within typical range)
+        outlier_vals = torch.rand_like(scan) * 2.0 - 1.0
+        scan = torch.where(torch.rand_like(scan) < self.outlier_rate, outlier_vals, scan)
+        return scan
+
+
+# ---------------------------------------------------------------------------
+# 3. MappingTrainer
+# ---------------------------------------------------------------------------
+
+class MappingTrainer:
+    """Training loop for MappingNet."""
+
+    def __init__(self, device: torch.device = torch.device("cpu"), lr: float = 1e-3,
+                 use_warp: bool = True):
+        self.device = device
+        self.use_warp = use_warp
+        self.model = MappingNet(MappingConfig()).to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        if use_warp:
+            from ame2.mapping_data import WarpMappingDataset
+            warp_device = str(device) if "cuda" in str(device) else "cuda:0"
+            self.dataset = WarpMappingDataset(device=warp_device)
+            self.terrain_gen = None
+            self.scan_sim = None
+        else:
+            self.dataset = None
+            self.terrain_gen = HeightFieldGenerator(device=device)
+            self.scan_sim = DepthScanSimulator(device=device)
+        self.loss_history = []
+
+    def train_step(self, B: int = 32) -> float:
+        self.model.train()
+        if self.use_warp:
+            gt, noisy_scan = self.dataset.sample_batch(B)
+            gt = gt.to(self.device)
+            noisy_scan = noisy_scan.to(self.device)
+        else:
+            gt = self.terrain_gen.generate(B)
+            noisy_scan = self.scan_sim.simulate(gt)
+        pred_elev, log_var = self.model(noisy_scan)
+        tv_weights = MappingNet.total_variation_weight(gt)
+        loss = MappingNet.beta_nll_loss(pred_elev, log_var, gt,
+                                        beta=0.5, tv_weights=tv_weights)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        loss_val = loss.item()
+        self.loss_history.append(loss_val)
+        return loss_val
+
+    @torch.no_grad()
+    def visualize(self, step: int, output_dir: str = "outputs"):
+        self.model.eval()
+        if self.use_warp:
+            gt, noisy_scan = self.dataset.sample_batch(1)
+            gt = gt.to(self.device)
+            noisy_scan = noisy_scan.to(self.device)
+        else:
+            gt = self.terrain_gen.generate(1)
+            noisy_scan = self.scan_sim.simulate(gt)
+        pred_elev, log_var = self.model(noisy_scan)
+
+        noisy_np = noisy_scan[0, 0].cpu().numpy()
+        pred_np = pred_elev[0, 0].cpu().numpy()
+        unc_np = torch.exp(log_var[0, 0]).cpu().numpy()
+        gt_np = gt[0, 0].cpu().numpy()
+
+        vmin = min(gt_np.min(), pred_np.min(), noisy_np.min())
+        vmax = max(gt_np.max(), pred_np.max(), noisy_np.max())
+
+        fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+        for ax, data, title, cmap, v in zip(
+            axes,
+            [noisy_np, pred_np, unc_np, gt_np],
+            ["Noisy Input", "Predicted Elevation", "Uncertainty (variance)", "Ground Truth"],
+            ["terrain", "terrain", "hot", "terrain"],
+            [(vmin, vmax), (vmin, vmax), (None, None), (vmin, vmax)],
+        ):
+            im = ax.imshow(data, cmap=cmap,
+                           vmin=v[0], vmax=v[1],
+                           aspect="auto", origin="lower")
+            ax.set_title(title)
+            plt.colorbar(im, ax=ax, fraction=0.046)
+
+        fig.suptitle(f"MappingNet - Step {step}", fontsize=14)
+        plt.tight_layout()
+        path = os.path.join(output_dir, f"mapping_{step:04d}.png")
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved visualization: {path}")
+
+    def plot_loss(self, output_dir: str = "outputs"):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(self.loss_history, linewidth=1.5, color="steelblue")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss (beta-NLL + TV)")
+        ax.set_title("MappingNet Training Loss")
+        ax.grid(True, alpha=0.3)
+        path = os.path.join(output_dir, "mapping_loss.png")
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved loss curve: {path}")
+
+
+# ---------------------------------------------------------------------------
+# 4. Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MappingNet pretraining (Phase 0)")
+    parser.add_argument("--num_steps", type=int, default=100,
+                        help="Number of gradient steps (paper: 54M frames total, ~1.7M steps at batch_size=32)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size per step")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Adam learning rate")
+    parser.add_argument("--save_path", type=str, default="logs/mapping_net.pt",
+                        help="Where to save the trained MappingNet weights")
+    parser.add_argument("--output_dir", type=str, default="outputs/mapping",
+                        help="Directory for visualisation outputs")
+    parser.add_argument("--vis_interval", type=int, default=20,
+                        help="Save visualisation every N steps (0 = disabled)")
+    parser.add_argument("--use_warp", action="store_true", default=True,
+                        help="Use Warp-raytraced terrain pipeline (default)")
+    parser.add_argument("--no_warp", dest="use_warp", action="store_false",
+                        help="Use legacy procedural pipeline (no Warp dependency)")
+    parser.add_argument("--wandb_project", type=str, default="locomotion_trainer",
+                        help="Wandb project name (set to '' to disable)")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Wandb run name (auto-generated if not set)")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline = "Warp raytracing" if args.use_warp else "legacy procedural"
+    print(f"Device: {device}  |  Pipeline: {pipeline}")
+    print(f"Training MappingNet for {args.num_steps} steps "
+          f"(batch_size={args.batch_size}, lr={args.lr})...")
+    print(f"Checkpoint will be saved to: {args.save_path}")
+    print("-" * 50)
+
+    # ── Wandb init ──
+    use_wandb = wandb is not None and args.wandb_project and os.environ.get("WANDB_MODE") != "disabled"
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"mapping-phase0-{args.num_steps // 1000}k",
+            config={
+                "num_steps": args.num_steps,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "pipeline": pipeline,
+                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            },
+            tags=["phase0", "mapping-net"],
+        )
+        print(f"Wandb: logging to project '{args.wandb_project}'")
+    else:
+        print("Wandb: disabled")
+
+    trainer = MappingTrainer(device=device, lr=args.lr, use_warp=args.use_warp)
+
+    for step in range(1, args.num_steps + 1):
+        loss = trainer.train_step(B=args.batch_size)
+        if step % max(1, args.num_steps // 10) == 0 or step == 1:
+            print(f"Step {step:6d}/{args.num_steps}  loss={loss:.5f}")
+        if use_wandb:
+            wandb.log({"loss": loss}, step=step)
+        if args.vis_interval > 0 and step % args.vis_interval == 0:
+            trainer.visualize(step, args.output_dir)
+            if use_wandb:
+                vis_path = os.path.join(args.output_dir, f"mapping_{step:04d}.png")
+                if os.path.exists(vis_path):
+                    wandb.log({"visualization": wandb.Image(vis_path)}, step=step)
+
+    print("-" * 50)
+    print("Training complete.")
+    trainer.plot_loss(args.output_dir)
+
+    # Save trained weights — consumed by Phase 1 / 2 via --mapping_ckpt
+    torch.save(trainer.model.state_dict(), args.save_path)
+    print(f"Model weights saved to: {args.save_path}")
+    print(f"Visualisations saved to: {args.output_dir}")
+
+    if use_wandb:
+        wandb.log({"loss_curve": wandb.Image(os.path.join(args.output_dir, "mapping_loss.png"))})
+        artifact = wandb.Artifact("mapping-net-weights", type="model")
+        artifact.add_file(args.save_path)
+        wandb.log_artifact(artifact)
+        wandb.finish()
+        print("Wandb: run finalized and artifact uploaded.")
