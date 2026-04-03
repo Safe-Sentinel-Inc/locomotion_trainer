@@ -1,5 +1,7 @@
 # Locomotion Trainer
 
+Generalized legged locomotion trainer supporting **ANYmal-D**, **Unitree G1**, and **LimX TRON**.
+
 ![RL Training Demo](assets/rl_training_demo.gif)
 
 ### Training Progress (ANYmal-D, 30K iterations)
